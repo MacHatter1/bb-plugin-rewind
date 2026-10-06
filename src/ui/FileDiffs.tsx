@@ -1,7 +1,7 @@
 // A lazily loaded list of changed files between two states; each file
 // expands to its patch in the host diff viewer. Both levels are bounded by
 // the server (file count and patch bytes).
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { experimental_Diff as Diff } from "@get-bb/plugin-sdk/app";
 import { Button } from "@/components/ui/button";
 import { Icon } from "@/components/ui/icon";
@@ -10,9 +10,9 @@ import { Counts, Spinner } from "./parts";
 
 const STATUS_LABELS: Record<string, string> = { A: "added", M: "modified", D: "deleted", T: "type changed" };
 
-function FilePatch({ threadId, from, to, path }: { threadId: string; from: string; to: string; path: string }) {
+function FilePatch({ threadId, from, to, path, comparison }: { threadId: string; from: string; to: string; path: string; comparison?: string | undefined }) {
   const rpc = useRewindRpc();
-  const patch = useLoadable(threadId, () => rpc.call("diff", { threadId, from, to, paths: [path], patch: true }), `${from}:${to}:${path}`);
+  const patch = useLoadable(threadId, () => rpc.call("diff", { threadId, from, to, paths: [path], patch: true, ...(comparison === undefined ? {} : { comparison }) }), `${from}:${to}:${comparison ?? ""}:${path}`);
   if (patch.loading && patch.data === null) return <Spinner label="Loading diff…" />;
   if (patch.error !== null) return <p className="text-xs text-destructive">{patch.error}</p>;
   const file = patch.data?.files[0];
@@ -27,7 +27,7 @@ function FilePatch({ threadId, from, to, path }: { threadId: string; from: strin
   );
 }
 
-function FileRow({ threadId, from, to, file }: { threadId: string; from: string; to: string; file: DiffResult["files"][number] }) {
+function FileRow({ threadId, from, to, file, comparison }: { threadId: string; from: string; to: string; file: DiffResult["files"][number]; comparison?: string | undefined }) {
   const [open, setOpen] = useState(false);
   return (
     <li className="py-1">
@@ -48,7 +48,7 @@ function FileRow({ threadId, from, to, file }: { threadId: string; from: string;
       </button>
       {open ? (
         <div className="mt-1 pl-6">
-          <FilePatch threadId={threadId} from={from} to={to} path={file.path} />
+          <FilePatch threadId={threadId} from={from} to={to} path={file.path} comparison={comparison} />
         </div>
       ) : null}
     </li>
@@ -60,6 +60,11 @@ export function FileDiffs({ threadId, from, to, emptyText = "No file changes." }
   const rpc = useRewindRpc();
   const diff = useLoadable(threadId, () => rpc.call("diff", { threadId, from, to }), `${from}:${to}`);
   const [limit, setLimit] = useState(50);
+  const comparison = diff.data?.comparison;
+  const rpcRef = useRef(rpc); rpcRef.current = rpc;
+  useEffect(() => () => {
+    if (comparison !== undefined) void rpcRef.current.call("releaseComparison", { threadId, from, to, comparison }).catch(() => undefined);
+  }, [threadId, from, to, comparison]);
   if (diff.loading && diff.data === null) return <Spinner label="Comparing files…" />;
   if (diff.error !== null) return <p className="text-xs text-destructive">{diff.error}</p>;
   const data = diff.data;
@@ -67,9 +72,10 @@ export function FileDiffs({ threadId, from, to, emptyText = "No file changes." }
   const shown = data.files.slice(0, limit);
   return (
     <div>
+      <Button variant="ghost" size="sm" onClick={diff.reload}>Refresh comparison</Button>
       <ul className="divide-y divide-border/60">
         {shown.map((file) => (
-          <FileRow key={file.path} threadId={threadId} from={from} to={to} file={file} />
+          <FileRow key={`${comparison ?? ""}:${file.path}`} threadId={threadId} from={from} to={to} file={file} comparison={comparison} />
         ))}
       </ul>
       {data.files.length > limit ? (

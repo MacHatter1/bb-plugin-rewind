@@ -525,7 +525,8 @@ export class RewindStore {
     this.db
       .prepare(
         `INSERT INTO restores (id, thread_id, environment_id, host_id, workspace, kind, target_checkpoint_id, pre_restore_checkpoint_id, status, event_mark, summary_json, error, created_at)
-         VALUES (@id, @threadId, @environmentId, @hostId, @workspace, @kind, @targetCheckpointId, @preRestoreCheckpointId, @status, @eventMark, @summary, @error, @createdAt)`,
+         VALUES (@id, @threadId, @environmentId, @hostId, @workspace, @kind, @targetCheckpointId, @preRestoreCheckpointId, @status, @eventMark, @summary, @error, @createdAt)
+         ON CONFLICT(id) DO UPDATE SET pre_restore_checkpoint_id = excluded.pre_restore_checkpoint_id, status = excluded.status, summary_json = excluded.summary_json, error = excluded.error`,
       )
       .run({ ...row, summary: row.summary === null ? null : JSON.stringify(row.summary) });
     return this.getRestore(row.id)!;

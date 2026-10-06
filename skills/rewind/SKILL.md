@@ -80,15 +80,22 @@ shortened to any unique prefix.
 
 - A restore takes a pre-restore checkpoint first and aborts if it cannot, so
   every restore can be undone, including one that stops part way (the error
-  says "did not finish"; `bb rewind undo --yes` puts every file back).
+  says "did not finish"; `bb rewind undo --yes` puts every file back). A lost
+  transport response may leave the outcome uncertain: Undo keeps its identity
+  across reload, refuses to skip to an older restore, and resolves the same
+  pre-restore ref after reconnecting. Missing and unavailable refs are distinct.
 - A restore never touches ignored files (`node_modules`, an ignored `.env`),
   `.git`, nested repositories, or files over the size cap (default 10 MB);
   those are listed as "left alone" or "skipped". bb's chat copies
   (`.bb/chats/`) are never captured or restored, so they never appear.
 - It deletes only non-ignored files the checkpoint does not contain, and
-  verifies afterwards that the files match the checkpoint.
-- It refuses while this thread, or any other thread in the same workspace, is
-  running. Rewind restores files only: if git HEAD moved (you committed), the
+  verifies afterwards that the files match the checkpoint. Newly ignored
+  absent files are not recreated; nested-repository transitions and lowered
+  size caps also protect older checkpoints. Oversized composed ignore sources
+  fail preparation explicitly rather than silently dropping rules.
+- It refuses while this thread, or any other thread in any environment on the
+  same host sharing the canonical workspace directory, is running. Aliases do
+  not bypass the gate; expired waits remain queued until the restore ends. Rewind restores files only: if git HEAD moved (you committed), the
   preview warns and commits stay as they are.
 - Checkpointing holds a message at most a fraction of a second; a slower
   checkpoint queues it ("Rewind: saving a checkpoint…") until saved, 30 s at

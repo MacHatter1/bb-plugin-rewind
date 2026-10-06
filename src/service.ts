@@ -302,12 +302,12 @@ export class RewindService {
   private readonly now: () => number;
   private readonly sleep: (ms: number) => Promise<void>;
   private readonly background = new Set<Promise<unknown>>();
-  /** Restores writing files, per environment. */
+  /** Restores writing files, per host-backed canonical workspace. */
   private readonly restoring = new Map<string, number>();
   /** Excerpts of messages queued behind a restore, for their checkpoints. */
   private readonly waitExcerpts = new Map<string, string | null>();
-  /** Messages released at the safety cap while a restore still ran, per environment. */
-  private readonly restoreCapReleases = new Map<string, string[]>();
+  /** Canonical binding for restore waits inherited from older environment-id gates. */
+  private readonly restoreWaitKeys = new Map<string, string>();
   /** Gate snapshots still running, by checkpoint id. */
   private readonly jobs = new Map<string, Promise<CheckpointRow>>();
   /** Checkpoints whose message went out before they finished: when it did. */
@@ -400,18 +400,51 @@ export class RewindService {
     };
   }
 
+  private async environmentThreads(environmentId?: string) {
+    const threads: Awaited<ReturnType<PluginBbSdk["threads"]["list"]>> = [];
+    const seen = new Set<string>();
+    for (let offset = 0; ; offset += 200) {
+      const page = await this.sdk.threads.list({ environmentId, includeHidden: true, limit: 200, offset });
+      for (const thread of page) {
+        if (seen.has(thread.id)) throw new RewindError("thread_enumeration_failed", "Thread pages repeated; cannot establish restore safety.");
+        seen.add(thread.id);
+        threads.push(thread);
+      }
+      if (page.length < 200) return threads;
+    }
+  }
+
   async runningThreads(environmentId: string, selfId: string): Promise<RunningThread[]> {
-    const threads = await this.sdk.threads.list({ environmentId, includeHidden: true, limit: 200 });
+    const environment = await this.sdk.environments.get({ environmentId });
+    if (environment.path === null) throw new RewindError("no_workspace", "Cannot establish workspace safety.");
+    const threads = await this.workspaceThreads({ hostId: environment.hostId, path: environment.path });
     return threads
-      .filter((thread) => thread.archivedAt === null && (RUNNING_STATUSES.has(thread.status) || RUNNING_STATUSES.has(thread.runtime.displayStatus)))
-      .map((thread) => ({ id: thread.id, title: thread.title ?? thread.titleFallback, status: thread.status, isSelf: thread.id === selfId }));
+      .filter((thread) => RUNNING_STATUSES.has(thread.status) || RUNNING_STATUSES.has(thread.runtime.displayStatus))
+      .map((thread) => ({ id: thread.id, title: thread.title ?? thread.titleFallback, status: RUNNING_STATUSES.has(thread.status) ? thread.status : thread.runtime.displayStatus, isSelf: thread.id === selfId }));
+  }
+
+  private async coordinationKey(workspace: { hostId: string; path: string }): Promise<string> {
+    const result = await this.deps.host.call("identity", { workspace: workspace.path }, { hostId: workspace.hostId, timeoutMs: 15_000 });
+    return `${workspace.hostId}\0${result.identity}`;
+  }
+
+  private async workspaceThreads(workspace: { hostId: string; path: string }) {
+    const key = await this.coordinationKey(workspace);
+    const threads = await this.environmentThreads();
+    const matching = new Set<string>();
+    for (const id of new Set(threads.map(t => t.environmentId).filter((id): id is string => id !== null))) {
+      const env = await this.sdk.environments.get({ environmentId: id });
+      if (env.hostId !== workspace.hostId || env.path === null || env.status === "destroyed") continue;
+      if (await this.coordinationKey({ hostId: env.hostId, path: env.path }) === key) matching.add(id);
+    }
+    return threads.filter(t => t.environmentId !== null && matching.has(t.environmentId));
   }
 
   private async workspaceInfo(threadId: string, workspace: ResolvedWorkspace): Promise<WorkspaceInfo> {
-    const threads = await this.sdk.threads.list({ environmentId: workspace.environmentId, includeHidden: true, limit: 200 }).catch(() => []);
+    const threads = await this.workspaceThreads(workspace);
     const running = threads
-      .filter((thread) => thread.archivedAt === null && (RUNNING_STATUSES.has(thread.status) || RUNNING_STATUSES.has(thread.runtime.displayStatus)))
-      .map((thread) => ({ id: thread.id, title: thread.title ?? thread.titleFallback, status: thread.status, isSelf: thread.id === threadId }));
+      .filter((thread) => RUNNING_STATUSES.has(thread.status) || RUNNING_STATUSES.has(thread.runtime.displayStatus))
+      .map((thread) => ({ id: thread.id, title: thread.title ?? thread.titleFallback, status: RUNNING_STATUSES.has(thread.status) ? thread.status : thread.runtime.displayStatus, isSelf: thread.id === threadId }));
     let unsupported: string | null = null;
     try {
       const status = await this.deps.host.call("status", { workspace: workspace.path, measureSize: false }, { hostId: workspace.hostId, timeoutMs: 15_000 });
@@ -553,13 +586,37 @@ export class RewindService {
   // ----------------------------------------------------------- the gate
 
   /**
+   * Synchronous last guard for a timed-out/failed dispatch hook. Without a
+   * resolved identity, any active restore on this host could share its files.
+   * Snapshot failures still fail open; destructive uncertainty does not.
+   */
+  dispatchFallback(ctx: MessageDispatchHookContext): MessageDispatchHookDecision {
+    const hostId = ctx.environment?.hostId;
+    if (hostId === undefined || ![...this.restoring.keys()].some(key => key.startsWith(`${hostId}\0`))) return PROCEED;
+    const started = this.now();
+    try {
+      const rows = this.ourRows(ctx.queuedMessages);
+      const wait = this.waitsByThread.get(ctx.thread.id);
+      // Unknown identity: recheck on restore completion, then resolve again.
+      if (wait?.kind !== "restore") {
+        const held = this.openWait(ctx.thread.id, null, "restore", null, rows, started);
+        this.waitExcerpts.set(held.id, excerpt(ctx.input.text));
+      }
+    } catch (error) {
+      // A bookkeeping error must not turn a safety wait into permission to run.
+      this.deps.log.warn(`could not record restore wait: ${errorText(error)}`);
+    }
+    return { action: "wait", reason: WAIT_REASON_RESTORE, sendAt: started + RESTORE_TIMEOUT_MS };
+  }
+
+  /**
    * The before-turn checkpoint. bb's hook runs under a server-wide lock, so
    * the gate holds a message at most `gateHoldMs`. A slower snapshot queues
    * the message ("wait") and releases it with `recheck` once the checkpoint
    * is saved, so the checkpoint is exact rather than late. A message Rewind
    * queued is never queued again for a snapshot: its re-attempt proceeds,
    * whoever triggered it. While a restore writes the environment, messages
-   * queue until it ends. Never throws; every failure proceeds.
+   * queue until it ends. Snapshot failures proceed; restore uncertainty waits.
    */
   async onDispatch(ctx: MessageDispatchHookContext): Promise<GateResult> {
     const started = this.now();
@@ -578,19 +635,21 @@ export class RewindService {
         this.updateWait(wait, { reattemptAt: started });
       }
 
-      if (environment !== null && this.isRestoring(environment.id)) {
-        // A restore is writing these files: hold every message until it ends,
-        // with automatic checkpoints on or off. The cap is a safety net only.
-        const since = wait?.kind === "restore" ? wait.createdAt : started;
-        if (started - since < RESTORE_TIMEOUT_MS) {
-          if (wait?.kind !== "restore") {
-            const opened = this.openWait(ctx.thread.id, environment.id, "restore", null, ours, started);
-            this.waitExcerpts.set(opened.id, excerpt(ctx.input.text));
-          }
-          return this.finishGate(ctx, started, { action: "wait", reason: WAIT_REASON_RESTORE, sendAt: since + RESTORE_TIMEOUT_MS }, "wait:restore", null, null);
+      let restoreKey: string | null = null;
+      if (environment !== null && this.restoring.size > 0) {
+        try {
+          if (environment.path === null) throw new Error("Workspace identity unavailable");
+          restoreKey = await this.coordinationKey({ hostId: environment.hostId, path: environment.path });
+        } catch {
+          return this.finishGate(ctx, started, this.dispatchFallback(ctx), "wait:restore-identity", null, null);
         }
-        this.noteRestoreCapRelease(environment.id, ctx.thread);
-        outcome = "released:restore-cap";
+      }
+      if (environment !== null && restoreKey !== null && this.isRestoring(restoreKey)) {
+        // Re-attempt deadlines never authorize bypassing an active restore.
+        const held = wait?.kind === "restore" ? wait : this.openWait(ctx.thread.id, restoreKey, "restore", null, ours, started);
+        this.restoreWaitKeys.set(held.id, restoreKey);
+        if (wait?.kind !== "restore") this.waitExcerpts.set(held.id, excerpt(ctx.input.text));
+        return this.finishGate(ctx, started, { action: "wait", reason: WAIT_REASON_RESTORE, sendAt: started + RESTORE_TIMEOUT_MS }, "wait:restore", null, null);
       } else if (!settings.enabled) {
         outcome = "skipped:disabled";
       } else if (environment === null) {
@@ -693,10 +752,29 @@ export class RewindService {
           outcome = "released:orphaned";
         }
       }
+      // Identity/event/snapshot waits yield to restores. The earlier safety
+      // check is not permission to dispatch after one of those waits finishes.
+      // Resolve aliases only if a restore is now active, then check ownership
+      // synchronously immediately before returning permission to core.
+      if (environment !== null && this.restoring.size > 0) {
+        try {
+          if (environment.path === null) throw new Error("Workspace identity unavailable");
+          restoreKey ??= await this.coordinationKey({ hostId: environment.hostId, path: environment.path });
+        } catch {
+          return this.finishGate(ctx, started, this.dispatchFallback(ctx), "wait:restore-identity", checkpointId, snapshotMs);
+        }
+        if (this.isRestoring(restoreKey)) {
+          const held = wait?.kind === "restore" ? wait : this.openWait(ctx.thread.id, restoreKey, "restore", null, ours, started);
+          this.restoreWaitKeys.set(held.id, restoreKey);
+          if (wait?.kind !== "restore") this.waitExcerpts.set(held.id, excerpt(ctx.input.text));
+          decision = { action: "wait", reason: WAIT_REASON_RESTORE, sendAt: started + RESTORE_TIMEOUT_MS };
+          outcome = "wait:restore";
+        }
+      }
     } catch (error) {
       outcome = "error";
-      decision = PROCEED;
-      this.deps.log.warn(`dispatch gate failed open: ${errorText(error)}`);
+      decision = this.dispatchFallback(ctx);
+      this.deps.log.warn(`dispatch gate fallback (${decision.action}): ${errorText(error)}`);
     }
     return this.finishGate(ctx, started, decision, outcome, checkpointId, snapshotMs);
   }
@@ -787,6 +865,7 @@ export class RewindService {
 
   private closeWait(wait: GateWaitRow, by: string): void {
     this.waitExcerpts.delete(wait.id);
+    this.restoreWaitKeys.delete(wait.id);
     const closedAt = this.now();
     wait.closedAt = closedAt;
     wait.closedBy = by;
@@ -858,14 +937,6 @@ export class RewindService {
 
   private isRestoring(environmentId: string): boolean {
     return (this.restoring.get(environmentId) ?? 0) > 0;
-  }
-
-  private noteRestoreCapRelease(environmentId: string, thread: { id: string; title?: string | null }): void {
-    const name = thread.title ?? thread.id;
-    this.deps.log.warn(`released a message to ${name} after ${RESTORE_TIMEOUT_MS / 60_000} minutes while a restore was still writing its files`);
-    const list = this.restoreCapReleases.get(environmentId) ?? [];
-    list.push(name);
-    this.restoreCapReleases.set(environmentId, list);
   }
 
   private async withDeadline<T, F>(work: Promise<T>, ms: number, fallback: F): Promise<T | F> {
@@ -1120,17 +1191,23 @@ export class RewindService {
     this.fillEffects(rows);
     const checkpoints = rows.map(toCheckpointDto);
     const restores = this.store.listRestores(threadId).map(toRestoreDto);
+    let undoRestoreId: string | null = null;
     let workspace: WorkspaceInfo | null = null;
     let workspaceError: string | null = null;
     let projectExcluded = false;
     try {
       const resolved = await this.resolveWorkspace(threadId);
       workspace = await this.workspaceInfo(threadId, resolved.workspace);
+      const latest = await this.latestWorkspaceRestore(resolved.workspace);
+      if (latest !== null && latest.undoneBy === null && latest.preRestoreCheckpointId !== null) {
+        undoRestoreId = latest.id;
+        if (!restores.some(row => row.id === latest.id)) restores.push(toRestoreDto(latest));
+      }
       projectExcluded = isProjectExcluded(settings, await this.projectOf(resolved.thread.projectId));
     } catch (error) {
       workspaceError = errorText(error);
     }
-    return { threadId, checkpoints, restores, workspace, workspaceError, settings: this.settingsDto(projectExcluded) };
+    return { threadId, checkpoints, restores, undoRestoreId, workspace, workspaceError, settings: this.settingsDto(projectExcluded) };
   }
 
   settingsDto(projectExcluded = false) {
@@ -1185,7 +1262,7 @@ export class RewindService {
     };
   }
 
-  async diff(input: { threadId: string; from: string; to: string; paths?: string[] | undefined; patch?: boolean | undefined }) {
+  async diff(input: { threadId: string; from: string; to: string; paths?: string[] | undefined; patch?: boolean | undefined; comparison?: string | undefined }) {
     const resolved = await this.resolveWorkspace(input.threadId).catch(() => null);
     const revision = (id: string): Revision => {
       if (id === "empty") return { kind: "empty" };
@@ -1200,7 +1277,7 @@ export class RewindService {
     const hostId = anchor?.hostId ?? resolved?.workspace.hostId;
     const workspace = anchor?.workspace ?? resolved?.workspace.path;
     if (hostId === undefined || workspace === undefined) throw new RewindError("no_environment", "Nothing to compare: the thread has no workspace.");
-    if ((to.kind === "workspace" || from.kind === "workspace") && (resolved === null || resolved.workspace.path !== workspace || resolved.workspace.hostId !== hostId)) {
+    if ((to.kind === "workspace" || from.kind === "workspace") && (resolved === null || resolved.workspace.hostId !== hostId || await this.coordinationKey(resolved.workspace) !== await this.coordinationKey({ hostId, path: workspace }))) {
       throw new RewindError("different_workspace", "That checkpoint belongs to another workspace; compare it with checkpoints instead of the current files.");
     }
     const result = await this.deps.host.call(
@@ -1211,6 +1288,7 @@ export class RewindService {
         to,
         paths: input.paths ?? null,
         patch: input.patch === true,
+        ...(input.comparison === undefined ? {} : { comparison: input.comparison }),
         maxFiles: input.patch === true ? 200 : 2_000,
         maxPatchBytesPerFile: MAX_PATCH_BYTES_PER_FILE,
         maxPatchBytesTotal: MAX_PATCH_BYTES_TOTAL,
@@ -1220,7 +1298,13 @@ export class RewindService {
       { hostId, timeoutMs: DIFF_TIMEOUT_MS },
     );
     if (result.status !== "ok") throw new RewindError(`diff_${result.status}`, result.reason);
-    return { files: result.files, totalFiles: result.totalFiles, filesTruncated: result.filesTruncated, stats: result.stats };
+    return { files: result.files, totalFiles: result.totalFiles, filesTruncated: result.filesTruncated, stats: result.stats, ...(result.comparison === undefined ? {} : { comparison: result.comparison }) };
+  }
+
+  async releaseComparison(input: { threadId: string; from: string; to: string; comparison: string }) {
+    const anchor = [input.from, input.to].map(id => this.store.getCheckpoint(id)).find(row => row !== null);
+    const workspace = anchor === undefined ? (await this.resolveWorkspace(input.threadId)).workspace : { hostId: anchor.hostId, path: anchor.workspace };
+    return this.deps.host.call("releaseComparison", { workspace: workspace.path, comparison: input.comparison }, { hostId: workspace.hostId, timeoutMs: 15_000 });
   }
 
   // ------------------------------------------------------------ restore
@@ -1263,7 +1347,8 @@ export class RewindService {
     const sourceWorkspace = this.sourceFor(checkpoint, workspace);
     // Messages to this environment queue from here on, so none can start a
     // turn between the running check and the end of the restore.
-    this.beginRestore(workspace.environmentId);
+    const coordinationKey = await this.coordinationKey(workspace);
+    this.beginRestore(coordinationKey);
     let outcome: RestoreOutcome;
     try {
       const running = await this.runningThreads(workspace.environmentId, threadId);
@@ -1277,7 +1362,7 @@ export class RewindService {
       }
       outcome = await this.applyRestore(threadId, workspace, checkpoint, sourceWorkspace, kind);
     } finally {
-      this.endRestore(workspace.environmentId);
+      this.endRestore(coordinationKey);
     }
     if (kind === "undo") {
       // Back to the files the conversation was built on: nothing to explain.
@@ -1300,8 +1385,8 @@ export class RewindService {
     const labels = new Set<string>();
     let after = fromMark;
     for (let page = 0; page < EFFECT_PAGES && after < toMark; page += 1) {
-      const rows = await this.commandStarts(threadId, after, toMark);
-      for (const row of rows) {
+      const pageData = await this.commandStarts(threadId, after, toMark);
+      for (const row of pageData.rows) {
         const item = (row.data as { item?: { type?: unknown; command?: unknown; cwd?: unknown } } | null)?.item;
         if (item?.type !== "commandExecution" || typeof item.command !== "string") continue;
         for (const effect of detectEffects(item.command, { workspace, cwd: typeof item.cwd === "string" ? item.cwd : null })) {
@@ -1310,20 +1395,23 @@ export class RewindService {
           effects.push({ kind: effect.kind, label: effect.label, command: effect.command });
         }
       }
-      if (rows.length < EFFECT_PAGE) break;
-      after = rows.at(-1)!.seq;
+      if (pageData.rawCount < EFFECT_PAGE) break;
+      if (pageData.lastSeq === null || pageData.lastSeq <= after) throw new Error("Event pagination did not advance");
+      after = pageData.lastSeq;
     }
     return effects.slice(0, MAX_EFFECTS_PER_RANGE);
   }
 
-  private async commandStarts(threadId: string, afterSeq: number, toSeq: number): Promise<Array<{ seq: number; type: string; data: unknown }>> {
+  private async commandStarts(threadId: string, afterSeq: number, toSeq: number): Promise<{ rows: Array<{ seq: number; type: string; data: unknown }>; rawCount: number; lastSeq: number | null }> {
     const range = { threadId, afterSeq: String(afterSeq), beforeSeq: String(toSeq + 1), order: "asc" as const, limit: String(EFFECT_PAGE) };
     try {
-      return await this.sdk.threads.events.list({ ...range, types: ["item/started"] });
+      const rows = await this.sdk.threads.events.list({ ...range, types: ["item/started"] });
+      return { rows, rawCount: rows.length, lastSeq: rows.at(-1)?.seq ?? null };
     } catch (error) {
       // A server that rejects the type filter still pages the range.
       this.deps.log.debug(`event type filter failed (${errorText(error)}); filtering locally`);
-      return (await this.sdk.threads.events.list(range)).filter((row) => row.type === "item/started");
+      const raw = await this.sdk.threads.events.list(range);
+      return { rows: raw.filter((row) => row.type === "item/started"), rawCount: raw.length, lastSeq: raw.at(-1)?.seq ?? null };
     }
   }
 
@@ -1398,6 +1486,7 @@ export class RewindService {
   }
 
   private beginRestore(environmentId: string): void {
+    if (this.isRestoring(environmentId)) throw new RewindError("restore_busy", "A restore is already in progress for this workspace. Wait for it to finish.");
     this.restoring.set(environmentId, (this.restoring.get(environmentId) ?? 0) + 1);
   }
 
@@ -1413,7 +1502,7 @@ export class RewindService {
       return;
     }
     this.restoring.delete(environmentId);
-    const held = (wait: GateWaitRow) => wait.kind === "restore" && wait.closedAt === null && (wait.environmentId === environmentId || wait.environmentId === null);
+    const held = (wait: GateWaitRow) => wait.kind === "restore" && wait.closedAt === null && (wait.environmentId === environmentId || this.restoreWaitKeys.get(wait.id) === environmentId || wait.environmentId === null);
     const waits = [...this.waitsByThread.values()].filter(held);
     if (waits.length === 0) return;
     void this.track(
@@ -1513,6 +1602,8 @@ export class RewindService {
     const restoreId = newId("rs", this.now());
     const started = this.now();
     const incompleteHint = "Undo it to put every file back as it was before the restore: `bb rewind undo --yes`, or Undo in the Checkpoints panel.";
+    // Durable before sending: a lost response or server restart cannot erase Undo identity.
+    this.recordRestore({ id: restoreId, threadId, workspace, kind, target: checkpoint, preRestoreCheckpointId: pre.id, status: "failed", eventMark: mark, summary: null, error: "Restore outcome unknown; files may have changed.", createdAt: started });
     let result;
     try {
       result = await this.deps.host.call(
@@ -1535,7 +1626,7 @@ export class RewindService {
         .call("refCommit", { workspace: workspace.path, checkpointId: pre.id }, { hostId: workspace.hostId, timeoutMs: 30_000 })
         .catch(() => null);
       const undoPoint = ref !== null && ref.commit !== null && ref.tree !== null ? this.undoPointFrom(pre, ref.commit, ref.tree, this.now() - started) : null;
-      if (undoPoint === null) {
+      if (undoPoint === null && ref !== null) {
         this.store.failCheckpoint(pre.id, "failed", errorText(error), { late: false, completedAt: this.now(), durationMs: this.now() - started });
       }
       this.recordRestore({
@@ -1544,7 +1635,7 @@ export class RewindService {
         workspace,
         kind,
         target: checkpoint,
-        preRestoreCheckpointId: undoPoint === null ? null : pre.id,
+        preRestoreCheckpointId: ref === null || undoPoint !== null ? pre.id : null,
         status: "failed",
         eventMark: mark,
         summary: null,
@@ -1552,12 +1643,13 @@ export class RewindService {
         createdAt: started,
       });
       this.deps.publish(threadId);
-      throw undoPoint === null
+      throw undoPoint === null && ref !== null
         ? new RewindError("restore_failed", `Nothing was restored: ${errorText(error)}`)
         : new RewindError("restore_incomplete", `The restore did not finish and some files may have changed: ${errorText(error)}`, incompleteHint);
     }
     if (result.status !== "ok" || result.preRestore === null) {
       const reason = result.status === "ok" ? "no pre-restore checkpoint was taken" : result.reason;
+      this.recordRestore({ id: restoreId, threadId, workspace, kind, target: checkpoint, preRestoreCheckpointId: null, status: "failed", eventMark: mark, summary: null, error: reason, createdAt: started });
       this.store.failCheckpoint(pre.id, result.status === "unsupported" ? "unsupported" : "failed", reason, {
         late: false,
         completedAt: this.now(),
@@ -1614,16 +1706,14 @@ export class RewindService {
     // Messages queue while the files are written, but Send now and turns an
     // agent starts by itself skip the queue: those are worth a warning.
     const warnings: string[] = [];
-    const startedMeanwhile = await this.runningThreads(workspace.environmentId, threadId).catch(() => []);
+    const startedMeanwhile = await this.runningThreads(workspace.environmentId, threadId).catch(error => {
+      warnings.push(`Could not establish whether threads started during the restore: ${errorText(error)}`);
+      return [];
+    });
     if (startedMeanwhile.length > 0) {
       warnings.push(
         `${startedMeanwhile.map((thread) => (thread.isSelf ? "This thread" : (thread.title ?? thread.id))).join(", ")} started a turn while the files were being restored; check its first edits.`,
       );
-    }
-    const capped = this.restoreCapReleases.get(workspace.environmentId);
-    if (capped !== undefined) {
-      this.restoreCapReleases.delete(workspace.environmentId);
-      warnings.push(`The restore ran so long that a message to ${capped.join(", ")} was sent before it finished; check that turn's first edits.`);
     }
     this.deps.publish(threadId);
     return {
@@ -1853,13 +1943,30 @@ export class RewindService {
     }
   }
 
+  private async latestWorkspaceRestore(workspace: { hostId: string; path: string }): Promise<RestoreRow | null> {
+    const key = await this.coordinationKey(workspace);
+    let latest: RestoreRow | null = null;
+    for (const candidate of this.store.workspaces()) {
+      if (candidate.hostId !== workspace.hostId) continue;
+      const row = this.store.latestRestoreInWorkspace(candidate.hostId, candidate.workspace);
+      if (row === null) continue;
+      if (await this.coordinationKey({ hostId: candidate.hostId, path: candidate.workspace }) === key && (latest === null || row.seq > latest.seq)) latest = row;
+    }
+    return latest;
+  }
+
   async undo(threadId: string, restoreId?: string): Promise<RestoreOutcome> {
     const { workspace } = await this.resolveWorkspace(threadId);
     // Failed restores count when they changed files: skipping a newer partial
     // one would roll the workspace back further than the user expects.
-    const restore = restoreId !== undefined ? this.store.getRestore(restoreId) : this.store.latestRestoreInWorkspace(workspace.hostId, workspace.path);
+    const latest = await this.latestWorkspaceRestore(workspace);
+    if (restoreId !== undefined && latest !== null && latest.id !== restoreId && latest.preRestoreCheckpointId !== null) {
+      const latestPre = this.store.getCheckpoint(latest.preRestoreCheckpointId);
+      if (latestPre === null || latestPre.status !== "ok") throw new RewindError("restore_uncertain", "The latest restore is uncertain and files may have changed; recover its Undo before selecting an older restore.");
+    }
+    const restore = restoreId !== undefined ? this.store.getRestore(restoreId) : latest;
     if (restore === null) throw new RewindError("nothing_to_undo", "There is no restore to undo in this workspace.");
-    if (restore.hostId !== workspace.hostId || restore.workspace !== workspace.path) {
+    if (restore.hostId !== workspace.hostId || await this.coordinationKey({ hostId: restore.hostId, path: restore.workspace }) !== await this.coordinationKey(workspace)) {
       throw new RewindError("different_workspace", `Restore ${restore.id} was applied to another workspace.`);
     }
     if (restore.preRestoreCheckpointId === null) {
@@ -1867,6 +1974,14 @@ export class RewindService {
     }
     if (restore.undoneBy !== null) {
       throw new RewindError("already_undone", `Restore ${restore.id} was already undone by ${restore.undoneBy}.`, "Undo that one instead: `bb rewind undo` undoes the latest restore.");
+    }
+    const pre = this.store.getCheckpoint(restore.preRestoreCheckpointId);
+    if (pre === null) throw new RewindError("undo_unavailable", "The restore's Undo identity is missing; refusing to undo an older restore.");
+    if (pre.status !== "ok") {
+      // Unavailable is not absent: let transport errors propagate, keeping this latest restore selected.
+      const ref = await this.deps.host.call("refCommit", { workspace: restore.workspace, checkpointId: pre.id }, { hostId: restore.hostId, timeoutMs: 30_000 });
+      if (ref.commit === null || ref.tree === null) throw new RewindError("undo_unavailable", "The uncertain restore has no available Undo ref; refusing to undo an older restore.");
+      this.undoPointFrom(pre, ref.commit, ref.tree, 0);
     }
     const outcome = await this.restore(threadId, restore.preRestoreCheckpointId, "undo");
     this.store.markUndone(restore.id, outcome.restore.id);
@@ -1924,6 +2039,34 @@ export class RewindService {
     return toForkJob(job);
   }
 
+  private async forkAnchor(checkpoint: CheckpointRow): Promise<number | undefined> {
+    if (checkpoint.eventMark === null) throw new RewindError("fork_boundary_unavailable", "Checkpoint has no conversation mark; provide an explicit anchor.");
+    const rows = new Map<number, ConversationRow>();
+    let before: { anchorId: string; anchorSeq: number } | null = null;
+    const cursors = new Set<string>();
+    for (let page = 0; page < TIMELINE_PAGES; page++) {
+      const timeline = await this.sdk.threads.timeline({ threadId: checkpoint.threadId, segmentLimit: "100", ...(before === null ? {} : { beforeAnchorId: before.anchorId, beforeAnchorSeq: String(before.anchorSeq) }) });
+      for (const row of conversationRows(timeline.rows)) rows.set(row.sourceSeqEnd, row);
+      const sorted = [...rows.values()].sort((a, b) => a.sourceSeqEnd - b.sourceSeqEnd);
+      const anchor = anchorForCheckpoint(checkpoint, sorted);
+      const next = (timeline as { timelinePage?: { hasOlderRows?: boolean; olderCursor?: { anchorId: string; anchorSeq: number } | null } }).timelinePage;
+      const complete = next?.hasOlderRows === false;
+      if (next?.hasOlderRows !== true && !complete && (sorted[0]?.sourceSeqEnd ?? Infinity) > checkpoint.eventMark) {
+        throw new RewindError("fork_boundary_unavailable", "Timeline has no authoritative pagination boundary; provide an explicit anchor.");
+      }
+      if (anchor !== undefined && (complete || (sorted[0]?.sourceSeqEnd ?? Infinity) <= checkpoint.eventMark)) return anchor;
+      if (complete) {
+        if (sorted.length === 0 && checkpoint.eventMark === 0) return undefined;
+        throw new RewindError("fork_boundary_unavailable", "Cannot establish this checkpoint's conversation boundary; provide an explicit anchor.");
+      }
+      if (next?.olderCursor == null) throw new RewindError("fork_boundary_unavailable", "Timeline pagination has no older cursor.");
+      const cursor = JSON.stringify(next.olderCursor);
+      if (cursors.has(cursor)) throw new RewindError("fork_boundary_unavailable", "Timeline cursor repeated; cannot establish the fork boundary.");
+      cursors.add(cursor); before = next.olderCursor;
+    }
+    throw new RewindError("fork_boundary_unavailable", `Conversation boundary exceeds ${TIMELINE_PAGES} timeline pages; provide an explicit anchor.`);
+  }
+
   private async runFork(jobId: string, checkpoint: CheckpointRow, input: { threadId: string; anchorSeq?: number | undefined; prompt?: string | undefined; title?: string | undefined }): Promise<void> {
     const step = (text: string) => this.store.updateFork(jobId, { step: text }, this.now());
     let forkThreadId: string | null = null;
@@ -1931,8 +2074,7 @@ export class RewindService {
       const source = await this.getThread(checkpoint.threadId);
       let anchor = input.anchorSeq;
       if (anchor === undefined) {
-        const timeline = await this.sdk.threads.timeline({ threadId: checkpoint.threadId });
-        anchor = anchorForCheckpoint(checkpoint, conversationRows(timeline.rows));
+        anchor = await this.forkAnchor(checkpoint);
       }
       const branch = checkpoint.head?.branch ?? null;
       const fork = await this.sdk.threads.fork({
@@ -1970,11 +2112,12 @@ export class RewindService {
       }
 
       step("Restoring the checkpoint's files");
-      this.beginRestore(workspace.environmentId);
+      const coordinationKey = await this.coordinationKey(workspace);
+      this.beginRestore(coordinationKey);
       try {
         await this.applyRestore(forkThreadId, workspace, checkpoint, this.sourceFor(checkpoint, workspace), "fork");
       } finally {
-        this.endRestore(workspace.environmentId);
+        this.endRestore(coordinationKey);
       }
 
       if (input.prompt !== undefined && input.prompt.trim().length > 0) {
@@ -2029,9 +2172,11 @@ export class RewindService {
     }
     const checkpoints = threadIds.flatMap((threadId) => this.store.listCheckpoints(threadId));
     const protectedIds = new Set<string>();
-    for (const threadId of threadIds) {
-      const latest = this.store.listRestores(threadId, 1).at(-1);
-      if (latest !== undefined) {
+    for (const workspace of this.store.workspaces()) {
+      // An unavailable canonical lookup must not destroy a potentially offered Undo.
+      const latest = await this.latestWorkspaceRestore({ hostId: workspace.hostId, path: workspace.workspace })
+        .catch(() => this.store.latestRestoreInWorkspace(workspace.hostId, workspace.workspace));
+      if (latest !== null) {
         protectedIds.add(latest.targetCheckpointId);
         if (latest.preRestoreCheckpointId !== null) protectedIds.add(latest.preRestoreCheckpointId);
       }

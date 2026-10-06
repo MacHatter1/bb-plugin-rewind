@@ -80,10 +80,10 @@ describe("restore planning", () => {
     expect(plan.keepCurrent.map((entry) => entry.path).sort()).toEqual([".env", "secret.key"]);
   });
 
-  it("leaves existing paths git cannot check alone, but still creates missing ones", async () => {
+  it("F07 protects unresolved existing and absent paths when ignore checks cannot establish safety", async () => {
     const plan = await planRestore([change("sub/file", "M"), change("other/new", "A")], probe({ sub: "dir", "sub/file": "file" }, { unknown: ["sub/file", "other/new"] }));
-    expect(plan.protect.map((entry) => [entry.path, entry.reason])).toEqual([["sub/file", "unverifiable"]]);
-    expect(plan.apply.map((entry) => entry.path)).toEqual(["other/new"]);
+    expect(plan.protect.map((entry) => [entry.path, entry.reason])).toEqual([["other/new", "unverifiable"], ["sub/file", "unverifiable"]]);
+    expect(plan.apply).toEqual([]);
   });
 
   it("treats a case-only rename as a replacement on case-insensitive filesystems", async () => {

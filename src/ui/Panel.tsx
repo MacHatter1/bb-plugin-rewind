@@ -75,7 +75,7 @@ function FocusCard({ threadId, focus }: { threadId: string; focus: FocusParams }
         threadId,
         message: { role: focus.role, sourceSeqEnd: focus.sourceSeqEnd, ...(focus.messageThreadId === null ? {} : { threadId: focus.messageThreadId }) },
       }),
-    `${focus.role}:${focus.sourceSeqEnd}`,
+    `${focus.messageThreadId ?? ""}:${focus.role}:${focus.sourceSeqEnd}`,
   );
   const title = focus.role === "user" ? "Rewind to before this message" : "Rewind to after this reply";
   const data = resolved.data;
@@ -238,14 +238,14 @@ function TurnRow({ threadId, group, previous }: { threadId: string; group: TurnG
   );
 }
 
-function RestoreHistory({ threadId, restores }: { threadId: string; restores: RestoreDto[] }) {
+function RestoreHistory({ threadId, restores, undoRestoreId }: { threadId: string; restores: RestoreDto[]; undoRestoreId?: string | null | undefined }) {
   const rpc = useRewindRpc();
   const [busy, setBusy] = useState<string | null>(null);
   if (restores.length === 0) return null;
   const newestFirst = [...restores].reverse();
   // Like `bb rewind undo`: the newest restore that changed files, including
   // one that stopped part way (a failure with an undo point).
-  const undoable = newestFirst.find((restore) => restore.undoneBy === null && restore.preRestoreCheckpointId !== null) ?? null;
+  const undoable = newestFirst.find((restore) => restore.undoneBy === null && restore.preRestoreCheckpointId !== null && (undoRestoreId === undefined || restore.id === undoRestoreId)) ?? null;
   const undo = async (restore: RestoreDto) => {
     setBusy(restore.id);
     try {
@@ -371,7 +371,7 @@ export function CheckpointsPanel({ threadId, params }: PluginThreadPanelProps) {
           )}
         </section>
       ) : null}
-      {list.data !== null ? <RestoreHistory threadId={threadId} restores={list.data.restores} /> : null}
+      {list.data !== null ? <RestoreHistory threadId={threadId} restores={list.data.restores} undoRestoreId={list.data.undoRestoreId} /> : null}
     </div>
   );
 }

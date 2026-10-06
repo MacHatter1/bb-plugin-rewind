@@ -24,6 +24,8 @@ export interface PlanProbe {
   userIgnored(paths: readonly string[]): Promise<{ ignored: ReadonlySet<string>; unknown: ReadonlySet<string> }>;
   /** True on case-insensitive filesystems. */
   caseInsensitive: boolean;
+  /** Independent capture-policy boundaries, including absent old target entries. */
+  protectedPath?(path: string): Promise<boolean>;
 }
 
 export interface PlannedChange {
@@ -82,6 +84,10 @@ export async function planRestore(changes: readonly TreeChange[], probe: PlanPro
   }
 
   const { ignored, unknown } = await probe.userIgnored(changes.map((change) => change.path));
+  const policyProtected = new Set<string>();
+  if (probe.protectedPath !== undefined) {
+    for (const change of changes) if (await probe.protectedPath(change.path)) policyProtected.add(change.path);
+  }
 
   const protect: ProtectedChange[] = [];
   const protectedDirectories: string[] = [];
@@ -92,8 +98,8 @@ export async function planRestore(changes: readonly TreeChange[], probe: PlanPro
     const path = change.path;
     // A path git cannot check (e.g. beyond a symlink the restore removes) is
     // still created: it does not exist, so creating it cannot lose anything.
-    if (ignored.has(path)) {
-      protect.push({ path, action: "create", reason: "ignored", change });
+    if (ignored.has(path) || policyProtected.has(path)) {
+      protect.push({ path, action: "create", reason: ignored.has(path) ? "ignored" : (await kindOf(path)) === null ? "unverifiable" : "exists-uncaptured", change });
       blockedCreates.add(path);
       continue;
     }
@@ -110,6 +116,11 @@ export async function planRestore(changes: readonly TreeChange[], probe: PlanPro
       }
       reason = "blocked-by-uncaptured";
       break;
+    }
+    if (reason === null && unknown.has(path)) {
+      // Only a known captured ancestor being removed makes an unverifiable create safe.
+      const removedAncestor = ancestors(path).some(ancestor => leaving.has(fold(ancestor)));
+      if (!removedAncestor) reason = "unverifiable";
     }
     if (reason === null && pathMayExist) {
       const kind = await kindOf(path);
@@ -140,7 +151,7 @@ export async function planRestore(changes: readonly TreeChange[], probe: PlanPro
     if (ignored.has(change.path)) {
       protect.push({ path: change.path, action, reason: "ignored", change });
       keepCurrent.push(change);
-    } else if (unknown.has(change.path)) {
+    } else if (unknown.has(change.path) || policyProtected.has(change.path)) {
       // An existing path git cannot vouch for: leave it as it is.
       protect.push({ path: change.path, action, reason: "unverifiable", change });
       keepCurrent.push(change);

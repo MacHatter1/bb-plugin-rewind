@@ -41,31 +41,33 @@ export interface Loadable<T> {
   error: string | null;
   loading: boolean;
   reload: () => void;
+  requestId: number;
+  /** Live check, including invalidation before React commits another render. */
+  isCurrent: () => boolean;
 }
 
 /** Load with `fetcher`; reload on thread changes. Stale responses are dropped. */
 export function useLoadable<T>(threadId: string, fetcher: () => Promise<T>, key: string): Loadable<T> {
-  const [data, setData] = useState<T | null>(null);
-  const [error, setError] = useState<string | null>(null);
-  const [loading, setLoading] = useState(true);
+  const identity = JSON.stringify([threadId, key]);
+  const identityRef = useRef(identity);
+  identityRef.current = identity;
+  const [state, setState] = useState<{ identity: string; requestId: number; data: T | null; error: string | null; loading: boolean }>({ identity, requestId: 0, data: null, error: null, loading: true });
   const generation = useRef(0);
   const fetcherRef = useRef(fetcher);
   fetcherRef.current = fetcher;
   const reload = useCallback(() => {
     generation.current += 1;
     const mine = generation.current;
-    setLoading(true);
+    const requestIdentity = identityRef.current;
+    setState({ identity: requestIdentity, requestId: mine, data: null, error: null, loading: true });
     fetcherRef.current().then(
       (value) => {
-        if (mine !== generation.current) return;
-        setData(value);
-        setError(null);
-        setLoading(false);
+        if (mine !== generation.current || requestIdentity !== identityRef.current) return;
+        setState({ identity: requestIdentity, requestId: mine, data: value, error: null, loading: false });
       },
       (cause: unknown) => {
-        if (mine !== generation.current) return;
-        setError(errorMessage(cause));
-        setLoading(false);
+        if (mine !== generation.current || requestIdentity !== identityRef.current) return;
+        setState({ identity: requestIdentity, requestId: mine, data: null, error: errorMessage(cause), loading: false });
       },
     );
   }, []);
@@ -76,5 +78,8 @@ export function useLoadable<T>(threadId: string, fetcher: () => Promise<T>, key:
     };
   }, [reload, threadId, key]);
   useThreadChanges(threadId, reload);
-  return { data, error, loading, reload };
+  // Suppress mismatches during render, before the key-change effect runs.
+  const matching = state.identity === identity && state.requestId === generation.current;
+  const isCurrent = () => state.identity === identityRef.current && state.requestId === generation.current && !state.loading && state.error === null && state.data !== null;
+  return { data: matching ? state.data : null, error: matching ? state.error : null, loading: !matching || state.loading, reload, requestId: generation.current, isCurrent };
 }

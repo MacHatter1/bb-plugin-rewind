@@ -46,8 +46,8 @@ export default async function plugin(bb: BbPluginApi) {
   });
 
   // Before every message: hold it briefly for its checkpoint, or queue it
-  // until the checkpoint is saved. onDispatch never throws; the race is a
-  // last guard against a hung call, and anything unexpected proceeds.
+  // until the checkpoint is saved. The last guard fails open for snapshots,
+  // but queues uncertain workspace identities while a host restore is active.
   bb.experimental_hooks.on("message.dispatch", async (ctx) => {
     let timer: ReturnType<typeof setTimeout> | undefined;
     try {
@@ -57,10 +57,11 @@ export default async function plugin(bb: BbPluginApi) {
           timer = setTimeout(() => resolve(null), GATE_HARD_LIMIT_MS);
         }),
       ]);
-      return result?.decision ?? { action: "proceed" };
+      return result?.decision ?? service.dispatchFallback(ctx);
     } catch (error) {
-      bb.log.warn(`dispatch gate error (message sent anyway): ${error instanceof Error ? error.message : String(error)}`);
-      return { action: "proceed" };
+      const decision = service.dispatchFallback(ctx);
+      bb.log.warn(`dispatch gate error (${decision.action}): ${error instanceof Error ? error.message : String(error)}`);
+      return decision;
     } finally {
       if (timer !== undefined) clearTimeout(timer);
     }
@@ -85,6 +86,7 @@ export default async function plugin(bb: BbPluginApi) {
       resolveMessage: ({ threadId, message }) => service.resolveMessage(threadId, message).catch(rpcError),
       preview: ({ threadId, checkpointId }) => service.preview(threadId, checkpointId).catch(rpcError),
       diff: (input) => service.diff(input).catch(rpcError),
+      releaseComparison: (input) => service.releaseComparison(input).catch(rpcError),
       restore: ({ threadId, checkpointId }) => service.restore(threadId, checkpointId).catch(rpcError),
       editMessage: (input) => service.editMessage(input).catch(rpcError),
       note: ({ threadId }) => ({ note: service.note(threadId) }),

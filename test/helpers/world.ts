@@ -55,6 +55,7 @@ export interface FakeThread {
   environmentId: string | null;
   status: "idle" | "active" | "starting" | "stopping" | "error" | "pending";
   title: string | null;
+  runtimeStatus?: FakeThread["status"];
   archivedAt: number | null;
   deletedAt: number | null;
   sourceThreadId: string | null;
@@ -106,6 +107,7 @@ export async function createWorld(options: WorldOptions = {}) {
   const edits: Array<Record<string, unknown>> = [];
   let beforeHostCall: HostCallHook | undefined = options.beforeHostCall;
   let counter = 0;
+  let afterHostCall: HostCallHook | undefined;
 
   const threadResponse = (thread: FakeThread) =>
     makeThreadResponse({
@@ -119,7 +121,7 @@ export async function createWorld(options: WorldOptions = {}) {
       sourceThreadId: thread.sourceThreadId,
       visibility: thread.visibility,
       providerId: thread.providerId,
-      runtime: { displayStatus: thread.status, hostReconnectGraceExpiresAt: null },
+      runtime: { displayStatus: thread.runtimeStatus ?? thread.status, hostReconnectGraceExpiresAt: null },
     });
 
   const environmentResponse = (environment: FakeEnvironment) => ({
@@ -150,10 +152,11 @@ export async function createWorld(options: WorldOptions = {}) {
     sdk: {
       threads: {
         get: async ({ threadId }: { threadId: string }) => threadResponse(requireThread(threadId)),
-        list: async ({ environmentId }: { environmentId?: string }) =>
+        list: async ({ environmentId, limit = 200, offset = 0 }: { environmentId?: string; limit?: number; offset?: number }) =>
           [...threads.values()]
             .filter((thread) => environmentId === undefined || thread.environmentId === environmentId)
             .filter((thread) => thread.deletedAt === null)
+            .slice(offset, offset + limit)
             .map((thread) => ({
               id: thread.id,
               title: thread.title,
@@ -161,7 +164,7 @@ export async function createWorld(options: WorldOptions = {}) {
               status: thread.status,
               archivedAt: thread.archivedAt,
               environmentId: thread.environmentId,
-              runtime: { displayStatus: thread.status, hostReconnectGraceExpiresAt: null },
+              runtime: { displayStatus: thread.runtimeStatus ?? thread.status, hostReconnectGraceExpiresAt: null },
             })),
         events: {
           list: async ({
@@ -191,14 +194,20 @@ export async function createWorld(options: WorldOptions = {}) {
           },
         },
         stop: async ({ threadId }: { threadId: string }) => {
-          requireThread(threadId).status = "idle";
+          const stopped = requireThread(threadId);
+          stopped.status = "idle"; stopped.runtimeStatus = "idle";
           return { ok: true };
         },
         storageLocation: async ({ threadId }: { threadId: string }) => {
           requireThread(threadId);
           return { hostId: HOST_ID, storageRootPath: options.storageRoot?.(threadId) ?? path.join(dataDir, "thread-storage", threadId) };
         },
-        timeline: async ({ threadId }: { threadId: string }) => ({ rows: requireThread(threadId).conversation, maxSeq: 0 }),
+        timeline: async ({ threadId, beforeAnchorSeq, segmentLimit = "100" }: { threadId: string; beforeAnchorSeq?: string; segmentLimit?: string }) => {
+          const all = requireThread(threadId).conversation.filter(row => beforeAnchorSeq === undefined || row.sourceSeqEnd < Number(beforeAnchorSeq));
+          const rows = all.slice(-Math.min(100, Number(segmentLimit)));
+          const hasOlderRows = all.length > rows.length;
+          return { rows, maxSeq: all.at(-1)?.sourceSeqEnd ?? 0, timelinePage: { hasOlderRows, olderCursor: hasOlderRows ? { anchorId: `row_${rows[0]!.sourceSeqEnd}`, anchorSeq: rows[0]!.sourceSeqEnd } : null } };
+        },
         fork: async (args: Record<string, unknown>) => {
           const source = requireThread(String(args.sourceThreadId));
           const fork = addThread({ projectId: source.projectId, environmentId: null, title: String(args.title ?? "fork"), sourceThreadId: source.id });
@@ -257,11 +266,13 @@ export async function createWorld(options: WorldOptions = {}) {
       const handler = (handlers as unknown as Record<string, (input: unknown, context: unknown) => Promise<unknown>>)[method];
       if (handler === undefined) throw new Error(`no host handler ${method}`);
       const controller = new AbortController();
-      return handler(input, {
+      const result = await handler(input, {
         signal: signal ?? controller.signal,
         lifecycle: { signal: controller.signal },
         experimental_paths: { dataDir, tempDir: dataDir },
       });
+      await afterHostCall?.(method, input);
+      return result;
     },
   });
   await plugin(bb);
@@ -395,6 +406,7 @@ export async function createWorld(options: WorldOptions = {}) {
     command,
     rpc,
     settled,
+    setAfterHostCall(hook: HostCallHook | undefined) { afterHostCall = hook; },
     setBeforeHostCall(hook: HostCallHook | undefined) {
       beforeHostCall = hook;
     },
