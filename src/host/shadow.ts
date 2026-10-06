@@ -503,13 +503,17 @@ export class Shadow {
     return true;
   }
 
-  /** Which of `paths` are in the shadow index (argv in bounded batches). */
+  /** Which of `paths` are in the shadow index, preserving their raw bytes. */
   private async indexedAmong(paths: readonly string[]): Promise<Set<string>> {
     const found = new Set<string>();
-    for (let start = 0; start < paths.length; start += 500) {
-      const batch = paths.slice(start, start + 500).map(toDisplay);
-      const output = (await this.git(["ls-files", "-z", "--cached", "--", ...batch])).stdout;
-      for (const record of splitNul(output)) found.add(toInternal(record));
+    if (paths.length === 0) return found;
+    const wanted = new Set(paths);
+    // Batched pathspecs repeatedly scan/match the index, even for unchanged
+    // files. List it once and intersect in memory; no lossy UTF-8 argv paths.
+    const output = (await this.git(["ls-files", "-z", "--cached"])).stdout;
+    for (const record of splitNul(output)) {
+      const candidate = toInternal(record);
+      if (wanted.has(candidate)) found.add(candidate);
     }
     return found;
   }
@@ -818,7 +822,10 @@ export class Shadow {
     await this.setRefs([[`refs/rewind/${checkpointId}`, commit]], commit);
 
     let comparedTo: string | null = null;
-    if (compareTo !== null && (await this.hasCommit(compareTo))) comparedTo = await this.treeOf(compareTo);
+    // The latest commit/tree pair was loaded under this workspace's lock.
+    // Resolve older baselines normally: another thread may compare to one.
+    if (compareTo !== null && compareTo === state.lastCommit && state.lastTree !== null) comparedTo = state.lastTree;
+    else if (compareTo !== null && (await this.hasCommit(compareTo))) comparedTo = await this.treeOf(compareTo);
     else if (state.lastTree !== null) comparedTo = state.lastTree;
     const changes = this.visible(await this.diffTrees(comparedTo ?? EMPTY_TREE, captured.tree));
     const head = await this.headInfo(captured.layout);

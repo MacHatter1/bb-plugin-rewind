@@ -2,7 +2,7 @@
 // handlers called through the SDK's host harness (so the contract schemas and
 // JSON transport apply exactly as in the daemon).
 import { execFileSync } from "node:child_process";
-import { chmod, lstat, readdir, readFile, rename, rm, stat, symlink, unlink, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, readdir, readFile, rename, rm, stat, symlink, unlink, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { experimental_createHostEntryHarness } from "@get-bb/plugin-sdk/testing/host";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -213,6 +213,29 @@ describe("snapshot and restore", () => {
     expect(third.stats).toEqual({ files: 1, insertions: 1, deletions: 1 });
   });
 
+  it("keeps older comparison baselines even when the current tree is deduplicated", async () => {
+    const ws = await tempDir("ws");
+    await initRepo(ws, { "a.txt": "one\n" });
+    const first = await okSnap(ws);
+    await write(ws, "a.txt", "two\n");
+    const second = await okSnap(ws, { compareTo: first.commit });
+    await write(ws, "b.txt", "new\n");
+    const latest = await okSnap(ws, { compareTo: second.commit });
+
+    const older = await okSnap(ws, { compareTo: first.commit });
+    expect(older.deduped).toBe(true);
+    expect(older.commit).toBe(latest.commit);
+    expect(older.comparedTo).toBe(first.tree);
+    expect(older.changes.map((change) => [change.path, change.status])).toEqual([["a.txt", "M"], ["b.txt", "A"]]);
+
+    const recent = await okSnap(ws, { compareTo: latest.commit });
+    expect(recent.comparedTo).toBe(latest.tree);
+    expect(recent.stats.files).toBe(0);
+    const missing = await okSnap(ws, { compareTo: "f".repeat(40) });
+    expect(missing.comparedTo).toBe(latest.tree);
+    expect(missing.stats.files).toBe(0);
+  });
+
   it("serializes concurrent snapshots of one workspace", async () => {
     const ws = await tempDir("ws");
     await initRepo(ws, { "a.txt": "one\n" });
@@ -369,6 +392,123 @@ describe("what a restore never touches", () => {
     expect(await readFile(path.join(ws, "dist/bundle.js"), "utf8")).toBe("bundle v1\n");
     expect(await readFile(path.join(ws, "dist/other.js"), "utf8")).toBe("untracked build output\n");
     expect(restored.verification?.ok).toBe(true);
+  });
+
+  it("captures and restores more than 500 tracked-but-ignored files without counting them twice", async () => {
+    const ws = await tempDir("ws");
+    await initRepo(ws, { ".gitignore": "build/\n", "src.ts": "src\n" });
+    for (let index = 0; index < 600; index += 1) {
+      await write(ws, `build/file-${String(index).padStart(3, "0")}.txt`, `${index}\n`);
+    }
+    const unusual = "build/space [literal] é.txt";
+    await write(ws, unusual, "unicode\n");
+    userGit(ws, "add", "-f", "--", "build/");
+    await write(ws, "build/untracked.txt", "ignored output\n");
+    const userGitBefore = await fingerprint(path.join(ws, ".git"));
+    const limits = { ...LIMITS, maxFiles: 603, maxFileBytes: 64 };
+
+    const first = await okSnap(ws, { limits });
+    expect(first.fileCount).toBe(603);
+    const unchanged = await okSnap(ws, { limits, compareTo: first.commit });
+    expect(unchanged.fileCount).toBe(603);
+    expect(unchanged.deduped).toBe(true);
+    expect(unchanged.stats.files).toBe(0);
+
+    await write(ws, "build/file-000.txt", "edited\n");
+    await unlink(path.join(ws, "build/file-599.txt"));
+    await write(ws, "build/file-003.txt", Buffer.alloc(65, 7));
+    if (POSIX) {
+      await chmod(path.join(ws, "build/file-001.txt"), 0o755);
+      await unlink(path.join(ws, "build/file-002.txt"));
+      await link(ws, "build/file-002.txt", "../src.ts");
+    }
+    const changed = await okSnap(ws, { limits, compareTo: unchanged.commit });
+    expect(changed.fileCount).toBe(601);
+    expect(Object.fromEntries(changed.changes.map((change) => [change.path, change.status]))).toMatchObject({
+      "build/file-000.txt": "M",
+      "build/file-599.txt": "D",
+      "build/file-003.txt": "D",
+      ...(POSIX ? { "build/file-001.txt": "M", "build/file-002.txt": "T" } : {}),
+    });
+    expect(changed.skipped).toContainEqual({ path: "build/file-003.txt", reason: "too-large", sizeBytes: 65 });
+
+    const restored = await restore(ws, first, { limits });
+    expect(restored.verification?.ok).toBe(true);
+    expect(await readFile(path.join(ws, "build/file-000.txt"), "utf8")).toBe("0\n");
+    expect(await readFile(path.join(ws, "build/file-599.txt"), "utf8")).toBe("599\n");
+    expect(await readFile(path.join(ws, unusual), "utf8")).toBe("unicode\n");
+    expect(await readFile(path.join(ws, "build/file-003.txt"))).toEqual(Buffer.alloc(65, 7));
+    expect(await readFile(path.join(ws, "build/untracked.txt"), "utf8")).toBe("ignored output\n");
+    if (POSIX) {
+      expect((await lstat(path.join(ws, "build/file-002.txt"))).isFile()).toBe(true);
+      expect((await lstat(path.join(ws, "build/file-001.txt"))).mode & 0o111).toBe(0);
+    }
+    expect(await fingerprint(path.join(ws, ".git"))).toBe(userGitBefore);
+  });
+
+  it("refreshes forced-file membership when the user index and ignore rules change", async () => {
+    const ws = await tempDir("ws");
+    await initRepo(ws, { ".gitignore": "build/\n", "src.ts": "src\n" });
+    await write(ws, "build/old.txt", "old v1\n");
+    userGit(ws, "add", "-f", "--", "build/old.txt");
+    const first = await okSnap(ws);
+
+    await write(ws, "build/new.txt", "new\n");
+    userGit(ws, "add", "-f", "--", "build/new.txt");
+    // Simulate the existing forced-list cache expiring after the index change.
+    clearUserRepoCaches();
+    const second = await okSnap(ws, { compareTo: first.commit });
+    expect(second.fileCount).toBe(4);
+    expect(second.changes.map((change) => [change.path, change.status])).toEqual([["build/new.txt", "A"]]);
+
+    userGit(ws, "rm", "--cached", "--", "build/old.txt");
+    await write(ws, ".gitignore", "build/\n# refreshed rules\n");
+    await write(ws, "build/old.txt", "now uncaptured\n");
+    clearUserRepoCaches();
+    const userGitBefore = await fingerprint(path.join(ws, ".git"));
+    const third = await okSnap(ws, { compareTo: second.commit });
+    expect(third.fileCount).toBe(3);
+    expect(third.changes.map((change) => [change.path, change.status])).toEqual([[".gitignore", "M"], ["build/old.txt", "D"]]);
+
+    const restored = await restore(ws, first);
+    expect(restored.verification?.ok).toBe(true);
+    expect(await readFile(path.join(ws, "build/old.txt"), "utf8")).toBe("now uncaptured\n");
+    expect(await fingerprint(path.join(ws, ".git"))).toBe(userGitBefore);
+  });
+
+  it.skipIf(!POSIX)("captures non-UTF-8 tracked-but-ignored names at the exact file limit", async (context) => {
+    const ws = await tempDir("ws");
+    await initRepo(ws, { ".gitignore": "build/\n", "src.ts": "src\n" });
+    await mkdir(path.join(ws, "build"));
+    const rawPath = Buffer.concat([Buffer.from(`${ws}/build/invalid-`), Buffer.from([0xff]), Buffer.from(".bin")]);
+    try {
+      await writeFile(rawPath, "raw v1\n");
+    } catch (error) {
+      // APFS rejects non-UTF-8 names even when passed as raw bytes.
+      if ((error as NodeJS.ErrnoException).code !== "EILSEQ") throw error;
+      context.skip();
+      return;
+    }
+    userGit(ws, "add", "-f", "--", "build/");
+    await write(ws, "build/untracked.bin", "ignored output\n");
+    const userGitBefore = await fingerprint(path.join(ws, ".git"));
+    const limits = { ...LIMITS, maxFiles: 3 };
+
+    const first = await okSnap(ws, { limits });
+    expect(first.fileCount).toBe(3);
+    const unchanged = await okSnap(ws, { limits, compareTo: first.commit });
+    expect(unchanged.deduped).toBe(true);
+    expect(unchanged.stats.files).toBe(0);
+    expect(unchanged.fileCount).toBe(3);
+
+    await writeFile(rawPath, "raw v2\n");
+    const changed = await okSnap(ws, { limits, compareTo: unchanged.commit });
+    expect(changed.stats.files).toBe(1);
+    const restored = await restore(ws, first, { limits });
+    expect(restored.verification?.ok).toBe(true);
+    expect(await readFile(rawPath, "utf8")).toBe("raw v1\n");
+    expect(await readFile(path.join(ws, "build/untracked.bin"), "utf8")).toBe("ignored output\n");
+    expect(await fingerprint(path.join(ws, ".git"))).toBe(userGitBefore);
   });
 
   it("honors ignore rules above a workspace that is a repository subdirectory", async () => {
