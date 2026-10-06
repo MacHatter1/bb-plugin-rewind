@@ -196,6 +196,7 @@ export const rpcContract = defineRpcContract({
         threadId: z.string(),
         checkpoints: z.array(checkpointDtoSchema),
         restores: z.array(restoreDtoSchema),
+        undoRestoreId: restoreIdSchema.nullable().optional(),
         workspace: workspaceInfoSchema.nullable(),
         workspaceError: z.string().nullable(),
         settings: settingsDtoSchema,
@@ -264,16 +265,22 @@ export const rpcContract = defineRpcContract({
         to: z.union([checkpointIdSchema, z.literal("current")]),
         paths: z.array(relativePathSchema).max(50).optional(),
         patch: z.boolean().optional(),
+        comparison: z.string().min(1).max(128).optional(),
       })
       .strict(),
     output: z
       .object({
         files: z.array(diffFileSchema),
+        comparison: z.string().max(128).optional(),
         totalFiles: z.number().int().min(0),
         filesTruncated: z.boolean(),
         stats: statsSchema,
       })
       .strict(),
+  },
+  releaseComparison: {
+    input: z.object({ threadId: threadIdSchema, from: z.string(), to: z.string(), comparison: z.string().min(1).max(128) }).strict(),
+    output: z.object({ released: z.boolean() }).strict(),
   },
   restore: {
     experimental_description: "Restore the thread's workspace to a checkpoint. Takes a pre-restore checkpoint first.",

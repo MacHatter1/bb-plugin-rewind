@@ -1,5 +1,5 @@
 // @vitest-environment jsdom
-import { fireEvent, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, waitFor, within } from "@testing-library/react";
 import { loadPluginApp, renderSlot } from "@get-bb/plugin-sdk/testing/app";
 import { afterEach, beforeAll, describe, expect, it } from "vitest";
 import type { CheckpointDto, RestoreDto } from "../src/rpc-contract";
@@ -167,6 +167,27 @@ describe("thread header control", () => {
 });
 
 describe("Checkpoints panel", () => {
+  it("F10 suppresses stale restore controls on a delayed then rejected target switch", async () => {
+    const { checkpoints, before2, after2 } = scenario();
+    let reject!: (error: Error) => void;
+    const pending = new Promise<never>((_, r) => { reject = r; });
+    const slot = renderPanel(null, {
+      list: () => listResult(checkpoints),
+      preview: (input: { checkpointId: string }) => input.checkpointId === after2.id ? pending : ({ checkpoint: before2, workspace, plan: { creates: 0, writes: 1, deletes: 0, changes: [], protected: [], protectedCount: 0, changesTruncated: false }, skipped: [], skippedCount: 0, effects: [], headMoved: false, currentHead: null }),
+    } as never);
+    await slot.findByText("Turn 2"); const turn = slot.getAllByRole("listitem")[0]!;
+    fireEvent.click(within(turn).getByRole("button", { name: "Restore before" }));
+    await waitFor(() => expect(within(turn).getByRole("button", { name: "Restore files" }).hasAttribute("disabled")).toBe(false));
+    fireEvent.click(within(turn).getByRole("button", { name: "Restore files" }));
+    const dialog = await slot.findByRole("dialog");
+    fireEvent.click(within(dialog).getByRole("button", { name: "Cancel" }));
+    fireEvent.click(within(turn).getByRole("button", { name: "Restore after" }));
+    await waitFor(() => expect(within(turn).getByRole("button", { name: "Restore files" }).hasAttribute("disabled")).toBe(true));
+    reject(new Error("new target preview unavailable"));
+    await slot.findByText("new target preview unavailable");
+    expect(within(turn).getByRole("button", { name: "Restore files" }).hasAttribute("disabled")).toBe(true);
+    expect(slot.inspection.rpcCalls.filter(c => ["restore", "stopRunning", "editMessage"].includes(c.method))).toHaveLength(0);
+  });
   it("lists turns newest first with excerpts, stats, and warnings", async () => {
     const { checkpoints } = scenario();
     const slot = renderPanel(null, { list: () => listResult(checkpoints) });
@@ -305,6 +326,47 @@ describe("Rewind to here", () => {
       },
     };
   }
+
+  it("F10 closes an open edit dialog immediately on thread/message identity switches", async () => {
+    const { rpc, before2 } = focusRpc();
+    let reject!: (error: Error) => void;
+    const pending = new Promise<never>((_, r) => { reject = r; });
+    const slot = renderPanel(focusParams, {
+      ...rpc,
+      resolveMessage: (input: { threadId: string }) => input.threadId === THREAD ? { match: "exact", checkpoint: before2, note: null, message: { editable: true, number: 2, text: "old text" } } : pending,
+      list: (input: { threadId: string }) => input.threadId === THREAD ? rpc.list() : listResult([]),
+    } as never);
+    const focus = await slot.findByRole("region", { name: /Rewind to before this message/u });
+    await waitFor(() => expect(within(focus).getByRole("button", { name: "Restore files and edit this message" }).hasAttribute("disabled")).toBe(false));
+    fireEvent.click(within(focus).getByRole("button", { name: "Restore files and edit this message" }));
+    const dialog = await slot.findByRole("dialog"); fireEvent.change(within(dialog).getByLabelText("New message"), { target: { value: "old draft" } });
+    const Component = app.threadPanelActions.find(a => a.id === "checkpoints")!.component;
+    slot.lifecycle.rerender(<Component threadId="thr_new0001" params={{ focus: { role: "user", sourceSeqEnd: 7, messageThreadId: "thr_new0001", excerpt: "new message" } }} />);
+    expect(slot.queryByRole("dialog")).toBeNull();
+    reject(new Error("new request rejected")); await slot.findByText("new request rejected");
+    expect(slot.inspection.rpcCalls.filter(c => ["restore", "editMessage", "stopRunning"].includes(c.method))).toHaveLength(0);
+  });
+
+  it.each(["committed", "batched"])("F10 cancels the pending stop-and-restore continuation after preview invalidation (%s)", async timing => {
+    const { rpc } = focusRpc({ workspace: { ...workspace, running: [{ id: "thr_other001", title: "other", status: "active", isSelf: false }] } });
+    let release!: (result: { stopped: string[] }) => void;
+    const stopped = new Promise<{ stopped: string[] }>(r => { release = r; });
+    const slot = renderPanel(focusParams, { ...rpc, stopRunning: () => stopped });
+    const button = await slot.findByRole("button", { name: "Stop it and restore" }); fireEvent.click(button);
+    await waitFor(() => expect(slot.inspection.rpcCalls.some(c => c.method === "stopRunning")).toBe(true));
+    if (timing === "committed") await slot.behavior.emitRealtime("rewind.changed", { threadId: THREAD });
+    await act(async () => {
+      if (timing === "batched") await slot.behavior.emitRealtime("rewind.changed", { threadId: THREAD });
+      release({ stopped: ["thr_other001"] }); await stopped;
+    });
+    expect(slot.inspection.rpcCalls.filter(c => c.method === "restore")).toHaveLength(0);
+  });
+
+  it("F08 does not fetch diffs inside a closed preview disclosure", async () => {
+    const { rpc } = focusRpc(); const slot = renderPanel(focusParams, rpc);
+    await slot.findByText(/Restoring changes 2 files/u);
+    expect(slot.inspection.rpcCalls.filter(c => c.method === "diff")).toHaveLength(0);
+  });
 
   it("resolves the message, previews the restore with warnings, and restores after confirmation", async () => {
     const { rpc, before2 } = focusRpc();

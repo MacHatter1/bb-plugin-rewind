@@ -1,11 +1,15 @@
 // Integration tests for the host entry: real git, real temp directories, the
 // handlers called through the SDK's host harness (so the contract schemas and
 // JSON transport apply exactly as in the daemon).
+import { mkdirSync, writeFileSync } from "node:fs";
+import fsPromises from "node:fs/promises";
+import childProcess from "node:child_process";
+import { syncBuiltinESMExports } from "node:module";
 import { execFileSync } from "node:child_process";
 import { chmod, lstat, mkdir, readdir, readFile, rename, rm, stat, symlink, unlink, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { experimental_createHostEntryHarness } from "@get-bb/plugin-sdk/testing/host";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import hostEntry from "../../host";
 import { newId } from "../../src/ids";
 import { resetGitBaseEnv } from "../../src/host/git";
@@ -103,6 +107,494 @@ function shadowGit(workspace: string, ...args: string[]): string {
   const gitDir = path.join(dataDir, "shadows", shadowKey(workspace), "git");
   return execFileSync("git", [`--git-dir=${gitDir}`, ...args], { encoding: "utf8", timeout: GIT_TIMEOUT_MS });
 }
+
+describe("review host regressions", () => {
+  it("F01 preserves self-contained historical diffs and imports after the source workspace vanishes", async () => {
+    const ws = await tempDir("source"); await write(ws, "a.txt", "one\n"); const first = await okSnap(ws);
+    await write(ws, "a.txt", "two\n"); const second = await okSnap(ws);
+    await rm(ws, { recursive: true, force: true });
+    const diff = await harness.experimental_call("diff", { workspace: ws, from: { kind: "checkpoint", commit: first.commit, checkpointId: first.checkpointId }, to: { kind: "checkpoint", commit: second.commit, checkpointId: second.checkpointId }, paths: null, patch: true, maxFiles: 20, maxPatchBytesPerFile: 10000, maxPatchBytesTotal: 10000, limits: LIMITS });
+    expect(diff.status).toBe("ok"); if (diff.status === "ok") expect(diff.files[0]?.patch).toContain("+two");
+    const target = await tempDir("target"); await write(target, "a.txt", "three\n");
+    expect((await restore(target, second, { sourceWorkspace: ws })).verification?.ok).toBe(true);
+    expect(await readFile(path.join(target, "a.txt"), "utf8")).toBe("two\n");
+  });
+  it("F06 cancelled queued work cannot orphan the still-running workspace lock", async () => {
+    const ws = await tempDir("ws"); await write(ws, "a.txt", "one\n"); const old = await okSnap(ws);
+    let entered!: () => void, release!: () => void, identity!: () => void;
+    const enteredPromise = new Promise<void>(r => { entered = r; }), barrier = new Promise<void>(r => { release = r; });
+    const identified = new Promise<void>(r => { identity = r; });
+    const read = fsPromises.readFile; let held = false;
+    const readSpy = vi.spyOn(fsPromises, "readFile").mockImplementation((async (...args: Parameters<typeof read>) => {
+      if (!held && String(args[0]).endsWith("state.json")) { held = true; entered(); await barrier; }
+      return read(...args);
+    }) as typeof read); syncBuiltinESMExports();
+    const saving = snap(ws); await enteredPromise;
+    const getStat = fsPromises.stat;
+    const statSpy = vi.spyOn(fsPromises, "stat").mockImplementation((async (...args: Parameters<typeof getStat>) => {
+      const result = await getStat(...args); if (String(args[0]) === ws) identity(); return result;
+    }) as typeof getStat); syncBuiltinESMExports();
+    const controller = new AbortController();
+    const diff = harness.experimental_call("diff", { workspace: ws, from: { kind: "checkpoint", commit: old.commit, checkpointId: old.checkpointId }, to: { kind: "workspace" }, paths: null, patch: false, maxFiles: 20, maxPatchBytesPerFile: 10000, maxPatchBytesTotal: 10000, limits: LIMITS }, { signal: controller.signal });
+    const rejected = expect(diff).rejects.toThrow(/abort|cancel/u);
+    try {
+      await identified; await new Promise<void>(r => setImmediate(r)); // Admission follows the completed identity I/O, not a wall-clock sleep.
+      controller.abort(); await rejected;
+      expect(activeLockCount()).toBe(1); // The first snapshot still owns the queue.
+    } finally { release(); await saving; readSpy.mockRestore(); statSpy.mockRestore(); syncBuiltinESMExports(); }
+    expect((await okSnap(ws)).deduped).toBe(true);
+  });
+  it("F01 never captures an in-workspace shadow store through an alias", async () => {
+    const ws = await tempDir("ws"); await write(ws, "a.txt", "one\n");
+    await harness.experimental_dispose(); dataDir = path.join(ws, "rewind-data"); harness = makeHarness(dataDir, await tempDir("tmp"));
+    const alias = path.join(await tempDir("alias"), "linked"); await symlink(ws, alias, "dir");
+    const captured = await okSnap(alias);
+    expect(shadowGit(alias, "ls-tree", "-r", "--name-only", captured.commit).trim().split("\n")).toEqual(["a.txt"]);
+  });
+  it("F01 preserves configured chat-storage protection through workspace aliases", async () => {
+    const ws = await tempDir("ws"); await write(ws, "a.txt", "one\n"); await write(ws, "thread-store/chat.json", "old chat\n");
+    const old = await okSnap(ws);
+    const alias = path.join(await tempDir("alias"), "linked"); await symlink(ws, alias, "dir");
+    const storage = path.join(ws, "thread-store"); await write(ws, "thread-store/chat.json", "new chat\n");
+    const captured = await okSnap(alias, { excludePaths: [storage] });
+    expect(shadowGit(alias, "ls-tree", "-r", "--name-only", captured.commit)).not.toContain("thread-store/");
+    await restore(alias, old, { sourceWorkspace: ws });
+    expect(await readFile(path.join(ws, "thread-store/chat.json"), "utf8")).toBe("new chat\n");
+  });
+  it("F08 rejects expired, wrong-workspace and cold-worker handles and releases pins", async () => {
+    const ws = await tempDir("ws"), other = await tempDir("other");
+    await write(ws, "a.txt", "one\n"); const old = await okSnap(ws); await write(ws, "a.txt", "two\n");
+    const input = { workspace: ws, from: { kind: "checkpoint" as const, commit: old.commit, checkpointId: old.checkpointId }, to: { kind: "workspace" as const }, paths: null, patch: false, maxFiles: 20, maxPatchBytesPerFile: 10000, maxPatchBytesTotal: 10000, limits: LIMITS };
+    const listed = await harness.experimental_call("diff", input);
+    if (listed.status !== "ok" || listed.comparison === undefined) throw new Error("No comparison handle");
+    expect(await harness.experimental_call("diff", { ...input, workspace: other, comparison: listed.comparison })).toMatchObject({ status: "unavailable" });
+    const clock = vi.spyOn(Date, "now").mockReturnValue(Date.now() + 120_001);
+    try { expect(await harness.experimental_call("diff", { ...input, comparison: listed.comparison })).toMatchObject({ status: "unavailable" }); }
+    finally { clock.mockRestore(); }
+    expect(shadowGit(ws, "for-each-ref", "refs/rewind-comparison")).toBe("");
+    const refreshed = await harness.experimental_call("diff", input);
+    if (refreshed.status !== "ok" || refreshed.comparison === undefined) throw new Error("No refreshed handle");
+    await harness.experimental_dispose(); harness = makeHarness(dataDir, await tempDir("tmp"));
+    expect(shadowGit(ws, "for-each-ref", "refs/rewind-comparison")).toBe("");
+    expect(await harness.experimental_call("diff", { ...input, comparison: refreshed.comparison })).toMatchObject({ status: "unavailable" });
+    const fresh = await harness.experimental_call("diff", input);
+    if (fresh.status !== "ok" || fresh.comparison === undefined) throw new Error("No fresh handle");
+    expect(await harness.experimental_call("releaseComparison", { workspace: ws, comparison: fresh.comparison })).toEqual({ released: true });
+    expect(shadowGit(ws, "for-each-ref", "refs/rewind-comparison")).toBe("");
+  });
+  it("F14 bounds reads during ignore-source growth and closes handles after errors", async () => {
+    const home = await tempDir("ignore-resource-home"), ws = await tempDir("ws");
+    const source = path.join(home, ".config", "git", "ignore");
+    await write(home, ".config/git/ignore", "#small\n"); await write(ws, "a.txt", "one\n");
+    const priorHome = process.env.HOME, priorXdg = process.env.XDG_CONFIG_HOME;
+    process.env.HOME = home; process.env.XDG_CONFIG_HOME = path.join(home, ".config"); resetGitBaseEnv(); clearUserRepoCaches();
+    let bytes = 0, largestBuffer = 0, closed = 0, failRead = false, grow = true;
+    const openFile = fsPromises.open;
+    const spy = vi.spyOn(fsPromises, "open").mockImplementation(async (...args: Parameters<typeof openFile>) => {
+      const handle = await openFile(...args);
+      if (String(args[0]) === source) {
+        const getStat = handle.stat.bind(handle);
+        handle.stat = (async () => {
+          const info = await getStat();
+          if (grow) await writeFile(source, "#".repeat(2 * 1024 * 1024) + "\n*.secret\n");
+          return info;
+        }) as typeof handle.stat;
+        const read = handle.read.bind(handle);
+        handle.read = (async (buffer: Buffer, offset: number, length: number, position: number) => {
+          largestBuffer = Math.max(largestBuffer, buffer.length);
+          if (failRead) throw new Error("resource read failure");
+          const result = await read(buffer, offset, length, position); bytes += result.bytesRead; return result;
+        }) as typeof handle.read;
+        const close = handle.close.bind(handle);
+        handle.close = async () => { closed++; await close(); };
+      }
+      return handle;
+    }); syncBuiltinESMExports();
+    try {
+      await expect(snap(ws)).rejects.toThrow(/ignore source.*exceeds/u);
+      expect(bytes).toBeLessThanOrEqual(1024 * 1024 + 1); expect(largestBuffer).toBeLessThanOrEqual(1024 * 1024 + 1); expect(closed).toBe(1);
+      await writeFile(source, "#small\n"); failRead = true;
+      await expect(snap(ws)).rejects.toThrow(/resource read failure/u); expect(closed).toBe(2);
+      grow = false; failRead = false; bytes = 0;
+      await writeFile(source, "*.secret\n" + "#".repeat(1024 * 1024 - 9));
+      await write(ws, "local.secret", "excluded\n");
+      const captured = await okSnap(ws);
+      expect(shadowGit(ws, "ls-tree", "-r", "--name-only", captured.commit)).not.toContain("local.secret");
+      expect(bytes).toBe(1024 * 1024); expect(closed).toBe(3);
+    } finally {
+      spy.mockRestore(); syncBuiltinESMExports();
+      if (priorHome === undefined) delete process.env.HOME; else process.env.HOME = priorHome;
+      if (priorXdg === undefined) delete process.env.XDG_CONFIG_HOME; else process.env.XDG_CONFIG_HOME = priorXdg;
+      resetGitBaseEnv(); clearUserRepoCaches();
+    }
+  });
+  it("F06 stops capture at the first cancelled nested-boundary probe", async () => {
+    const ws = await tempDir("ws");
+    for (let i = 0; i < 300; i++) await write(ws, `dir${i}/file.txt`, "old\n");
+    const old = await okSnap(ws);
+    const controller = new AbortController(), realLstat = fsPromises.lstat;
+    let probes = 0, afterCancellation = 0;
+    const spy = vi.spyOn(fsPromises, "lstat").mockImplementation((async (...args: Parameters<typeof realLstat>) => {
+      const nestedProbe = String(args[0]).startsWith(ws + path.sep) && String(args[0]).endsWith("/.git");
+      if (nestedProbe) { probes++; if (controller.signal.aborted) afterCancellation++; }
+      try { return await realLstat(...args); }
+      finally { if (nestedProbe && probes === 1) controller.abort(); }
+    }) as typeof realLstat); syncBuiltinESMExports();
+    try {
+      await expect(harness.experimental_call("diff", { workspace: ws, from: { kind: "checkpoint", commit: old.commit, checkpointId: old.checkpointId }, to: { kind: "workspace" }, paths: null, patch: false, maxFiles: 20, maxPatchBytesPerFile: 10000, maxPatchBytesTotal: 10000, limits: LIMITS }, { signal: controller.signal })).rejects.toThrow(/abort|cancel/u);
+      expect(probes).toBeLessThanOrEqual(1);
+      expect(afterCancellation).toBe(0);
+      expect(activeLockCount()).toBe(0);
+    } finally { spy.mockRestore(); syncBuiltinESMExports(); }
+    expect((await okSnap(ws)).deduped).toBe(true);
+  });
+  it.each(["changed-files", "reduced-cap"])("F06 bounds cancelled capture stat workers (%s)", async phase => {
+    const ws = await tempDir("ws");
+    for (let i = 0; i < 300; i++) await write(ws, `f${i}.txt`, "old\n");
+    const old = await okSnap(ws);
+    if (phase === "changed-files") for (let i = 0; i < 300; i++) await write(ws, `f${i}.txt`, "changed\n");
+    const controller = new AbortController(), realLstat = fsPromises.lstat, realAccess = fsPromises.access;
+    let probes = 0, afterCancellation = 0, accesses = 0, settled = false;
+    let batchReady!: () => void, releaseWorker!: () => void;
+    const batch = new Promise<void>(resolve => { batchReady = resolve; });
+    const workerBarrier = new Promise<void>(resolve => { releaseWorker = resolve; });
+    const cancelled = new Promise<void>(resolve => controller.signal.addEventListener("abort", () => resolve(), { once: true }));
+    const spy = vi.spyOn(fsPromises, "lstat").mockImplementation((async (...args: Parameters<typeof realLstat>) => {
+      const candidate = String(args[0]).startsWith(ws + path.sep) && /^f\d+\.txt$/u.test(path.basename(String(args[0])));
+      const ordinal = candidate ? ++probes : 0;
+      if (candidate && controller.signal.aborted) afterCancellation++;
+      if (ordinal === 2) batchReady();
+      const result = await realLstat(...args);
+      if (ordinal === 1) { await batch; controller.abort(); }
+      else if (ordinal > 1) { await cancelled; if (ordinal === 2) await workerBarrier; }
+      return result;
+    }) as typeof realLstat);
+    const accessSpy = vi.spyOn(fsPromises, "access").mockImplementation(async (...args: Parameters<typeof realAccess>) => {
+      if (String(args[0]).startsWith(ws + path.sep)) accesses++;
+      return realAccess(...args);
+    }); syncBuiltinESMExports();
+    const diff = harness.experimental_call("diff", { workspace: ws, from: { kind: "checkpoint", commit: old.commit, checkpointId: old.checkpointId }, to: { kind: "workspace" }, paths: null, patch: false, maxFiles: 20, maxPatchBytesPerFile: 10000, maxPatchBytesTotal: 10000, limits: phase === "reduced-cap" ? { ...LIMITS, maxFileBytes: 3 } : LIMITS }, { signal: controller.signal });
+    void diff.then(() => { settled = true; }, () => { settled = true; });
+    const rejected = expect(diff).rejects.toThrow(/abort|cancel/u);
+    try {
+      await cancelled;
+      await new Promise<void>(resolve => setImmediate(resolve)); // Let cancellation continuations run, with one real I/O still admitted.
+      expect(settled).toBe(false);
+      expect(activeLockCount()).toBe(1);
+      releaseWorker(); await rejected;
+      // Only the bounded batch of already admitted filesystem calls may finish.
+      expect(probes).toBeLessThanOrEqual(32);
+      expect(afterCancellation).toBe(0);
+      expect(accesses).toBe(0);
+      expect(activeLockCount()).toBe(0);
+    } finally { releaseWorker(); await rejected; spy.mockRestore(); accessSpy.mockRestore(); syncBuiltinESMExports(); }
+    expect((await okSnap(ws)).status).toBe("ok");
+  });
+  it("F06 finishes and verifies a real restore after write-phase cancellation", async () => {
+    const ws = await tempDir("ws"); await initRepo(ws, { "a.txt": "old\n", "nested/keep.txt": "keep\n" });
+    const old = await okSnap(ws); await write(ws, "a.txt", "new\n"); await write(ws, "extra.txt", "delete\n");
+    const controller = new AbortController(), spawn = childProcess.spawn;
+    let writes = 0;
+    const spy = vi.spyOn(childProcess, "spawn").mockImplementation(((...args: Parameters<typeof spawn>) => {
+      const child = spawn(...args);
+      if ((args[1] as string[]).includes("read-tree") && (args[1] as string[]).includes("-u")) {
+        writes++; child.once("spawn", () => controller.abort());
+      }
+      return child;
+    }) as typeof spawn); syncBuiltinESMExports();
+    try {
+      const preRestoreId = newId("ck");
+      const result = await harness.experimental_call("restore", { workspace: ws, target: { commit: old.commit, checkpointId: old.checkpointId, sourceWorkspace: null }, preRestore: { checkpointId: preRestoreId, subject: "undo" }, dryRun: false, maxListed: 500, limits: LIMITS }, { signal: controller.signal });
+      expect(controller.signal.aborted).toBe(true); expect(writes).toBe(1);
+      expect(result).toMatchObject({ status: "ok", applied: true, verification: { ok: true }, applyError: null });
+      expect(await readFile(path.join(ws, "a.txt"), "utf8")).toBe("old\n");
+      expect(await exists(path.join(ws, "extra.txt"))).toBe(false);
+      expect(await harness.experimental_call("refCommit", { workspace: ws, checkpointId: preRestoreId })).toMatchObject({ commit: expect.any(String) });
+      expect(activeLockCount()).toBe(0);
+    } finally { spy.mockRestore(); syncBuiltinESMExports(); }
+  });
+  it("F06 aborts an in-flight Git patch and the next snapshot obtains the lock", async () => {
+    const ws = await tempDir("ws"); await initRepo(ws, { "a.txt": "old\n" }); const old = await okSnap(ws);
+    await write(ws, "a.txt", "new\n");
+    const controller = new AbortController(), spawn = childProcess.spawn; let patchProcesses = 0;
+    const spy = vi.spyOn(childProcess, "spawn").mockImplementation(((...args: Parameters<typeof spawn>) => {
+      const child = spawn(...args);
+      if ((args[1] as string[]).includes("-p")) { patchProcesses++; child.once("spawn", () => controller.abort()); }
+      return child;
+    }) as typeof spawn); syncBuiltinESMExports();
+    try {
+      await expect(harness.experimental_call("diff", { workspace: ws, from: { kind: "checkpoint", commit: old.commit, checkpointId: old.checkpointId }, to: { kind: "workspace" }, paths: ["a.txt"], patch: true, maxFiles: 20, maxPatchBytesPerFile: 10000, maxPatchBytesTotal: 10000, limits: LIMITS }, { signal: controller.signal })).rejects.toThrow(/abort|cancel/u);
+      expect(patchProcesses).toBe(1);
+      expect((await okSnap(ws)).status).toBe("ok"); expect(activeLockCount()).toBe(0);
+    } finally { spy.mockRestore(); syncBuiltinESMExports(); }
+  });
+  it("F09 verifies large disjoint skipped and leftover sets with bounded output", async () => {
+    const ws = await tempDir("ws"); await write(ws, "a.txt", "old\n"); const old = await okSnap(ws);
+    await write(ws, "a.txt", "new\n");
+    for (let i = 0; i < 600; i++) await write(ws, `skipped/f${i}`, "x".repeat(64));
+    const spawn = childProcess.spawn; let introduced = false;
+    const spy = vi.spyOn(childProcess, "spawn").mockImplementation(((...args: Parameters<typeof spawn>) => {
+      const argv = args[1] as string[];
+      if (!introduced && argv.includes("read-tree") && argv.includes("-u")) {
+        introduced = true; mkdirSync(path.join(ws, "leftovers"));
+        for (let i = 0; i < 600; i++) writeFileSync(path.join(ws, "leftovers", `f${i}`), "late\n");
+      }
+      return spawn(...args);
+    }) as typeof spawn); syncBuiltinESMExports();
+    try {
+      const result = await restore(ws, old, { limits: { ...LIMITS, maxFileBytes: 32 } });
+      expect(result.verification?.ok).toBe(true);
+      expect(result.verification?.untouchedCount).toBe(600);
+      expect(result.verification?.untouched).toHaveLength(50);
+      expect(result.verification?.untouched.every(p => p.startsWith("leftovers/"))).toBe(true);
+    } finally { spy.mockRestore(); syncBuiltinESMExports(); }
+  });
+  it("F08 reuses immutable comparison trees for patches without recapturing", async () => {
+    const ws = await tempDir("ws"); await initRepo(ws, { "a.txt": "old\n", "b.txt": "old\n", "c.txt": "old\n" });
+    const first = await okSnap(ws);
+    for (const name of ["a", "b", "c"]) await write(ws, `${name}.txt`, "listed current\n");
+    const spawn = childProcess.spawn; let captures = 0;
+    const spy = vi.spyOn(childProcess, "spawn").mockImplementation(((...args: Parameters<typeof spawn>) => {
+      if ((args[1] as string[]).includes("status")) captures++;
+      return spawn(...args);
+    }) as typeof spawn); syncBuiltinESMExports();
+    const input = { workspace: ws, from: { kind: "checkpoint" as const, commit: first.commit, checkpointId: first.checkpointId }, to: { kind: "workspace" as const }, paths: null, patch: false, maxFiles: 20, maxPatchBytesPerFile: 10000, maxPatchBytesTotal: 10000, limits: LIMITS };
+    try {
+      const listed = await harness.experimental_call("diff", input);
+      if (listed.status !== "ok") throw new Error(listed.status);
+      const comparison = (listed as typeof listed & { comparison?: string }).comparison;
+      await write(ws, "a.txt", "edited after list\n");
+      for (const name of ["a", "b", "c"]) {
+        const patch = await harness.experimental_call("diff", { ...input, paths: [`${name}.txt`], patch: true, ...(comparison === undefined ? {} : { comparison }) });
+        if (patch.status !== "ok") throw new Error(patch.status);
+        expect(patch.toTree).toBe(listed.toTree);
+        expect(patch.files[0]?.patch).toContain("listed current");
+      }
+      expect(captures).toBeLessThanOrEqual(1);
+      expect(comparison).toBeTruthy();
+    } finally { spy.mockRestore(); syncBuiltinESMExports(); }
+  });
+  it.each(["normal", "budget", "cancel"])("F07 isolates one real submodule path among 1001 changes within a bounded Git budget (%s)", async scenario => {
+    const ws = await tempDir("ws"); await initRepo(ws, { "sub/file.txt": "old\n" });
+    for (let i = 0; i < 1000; i++) await write(ws, `files/f${i}.txt`, "old\n");
+    const old = await okSnap(ws);
+    for (let i = 0; i < 1000; i++) await write(ws, `files/f${i}.txt`, "new\n");
+    await initRepo(path.join(ws, "sub"), { "file.txt": "nested\n" });
+    userGit(ws, "rm", "--cached", "sub/file.txt");
+    userGit(ws, "update-index", "--add", "--cacheinfo", `160000,${userGit(path.join(ws, "sub"), "rev-parse", "HEAD").trim()},sub`);
+    const spawn = childProcess.spawn; let checks = 0, now = Date.now();
+    const clock = scenario === "budget" ? vi.spyOn(Date, "now").mockImplementation(() => now) : null;
+    const controller = new AbortController();
+    const spy = vi.spyOn(childProcess, "spawn").mockImplementation(((...args: Parameters<typeof spawn>) => {
+      if ((args[1] as string[]).includes("check-ignore")) {
+        checks++;
+        if (scenario === "budget") now += 31_000;
+        if (scenario === "cancel") controller.abort();
+      }
+      return spawn(...args);
+    }) as typeof spawn); syncBuiltinESMExports();
+    try {
+      if (scenario === "cancel") {
+        await expect(harness.experimental_call("restore", { workspace: ws, target: { commit: old.commit, checkpointId: old.checkpointId, sourceWorkspace: null }, preRestore: null, dryRun: true, maxListed: 500, limits: LIMITS }, { signal: controller.signal })).rejects.toThrow(/abort|cancel/u);
+        expect(checks).toBeLessThanOrEqual(1);
+        await okSnap(ws); // No cancelled process or lock may retain the queue.
+      } else {
+        const result = await restore(ws, old, { dryRun: true });
+        if (scenario === "normal") expect(result.plan.protected.map(p => p.path)).toContain("sub/file.txt");
+        else {
+          expect(result.plan.protectedCount).toBe(1001);
+          expect(result.plan.writes).toBe(0); expect(result.plan.creates).toBe(0);
+          expect(checks).toBeLessThanOrEqual(2);
+        }
+        expect(checks).toBeLessThanOrEqual(32); // Logarithmic isolation, not 1001 serial Git calls.
+      }
+      expect(await readFile(path.join(ws, "files/f0.txt"), "utf8")).toBe("new\n");
+    } finally { clock?.mockRestore(); spy.mockRestore(); syncBuiltinESMExports(); }
+  });
+  it("F06 cancelled queued diffs never begin capture and release the queue", async () => {
+    const ws = await tempDir("ws"); await write(ws, "a.txt", "one\n"); const first = await okSnap(ws);
+    let entered!: () => void, release!: () => void;
+    const started = new Promise<void>(r => { entered = r; }), barrier = new Promise<void>(r => { release = r; });
+    const read = fsPromises.readFile;
+    let held = false;
+    const spy = vi.spyOn(fsPromises, "readFile").mockImplementation((async (...args: Parameters<typeof read>) => {
+      if (!held && String(args[0]).endsWith("state.json")) { held = true; entered(); await barrier; }
+      return read(...args);
+    }) as typeof read);
+    syncBuiltinESMExports();
+    const saving = snap(ws);
+    await started;
+    const controller = new AbortController();
+    const cancelled = harness.experimental_call("diff", {
+      workspace: ws, from: { kind: "checkpoint", commit: first.commit, checkpointId: first.checkpointId }, to: { kind: "workspace" }, paths: null, patch: true,
+      maxFiles: 20, maxPatchBytesPerFile: 10000, maxPatchBytesTotal: 10000, limits: LIMITS,
+    }, { signal: controller.signal });
+    const observed = expect(cancelled).rejects.toThrow(/abort|cancel/u);
+    controller.abort(); release();
+    try { await saving; await observed; expect((await okSnap(ws)).deduped).toBe(true); }
+    finally { release(); spy.mockRestore(); syncBuiltinESMExports(); }
+  });
+  it.each(["global", "info", "ancestor"])("F14 refuses oversized ignore sources with rules beyond the cap before restore writes (%s)", async sourceKind => {
+    const home = await tempDir("ignore-home"), root = await tempDir("ws");
+    if (sourceKind !== "global") await initRepo(root, { "root.txt": "one\n" });
+    const ws = sourceKind === "ancestor" ? path.join(root, "sub") : root;
+    await write(ws, "a.txt", "one\n");
+    const old = await okSnap(ws); await write(ws, "a.txt", "keep\n");
+    const source = sourceKind === "global" ? path.join(home, ".config/git/ignore") : sourceKind === "info" ? path.join(root, ".git/info/exclude") : path.join(root, ".gitignore");
+    await mkdir(path.dirname(source), { recursive: true });
+    await writeFile(source, "#".repeat(1024 * 1024 + 10) + "\n*.secret\n");
+    await write(ws, "late.secret", "must not capture\n");
+    const priorHome = process.env.HOME, priorXdg = process.env.XDG_CONFIG_HOME;
+    process.env.HOME = home; process.env.XDG_CONFIG_HOME = path.join(home, ".config"); resetGitBaseEnv(); clearUserRepoCaches();
+    try {
+      await expect(snap(ws)).rejects.toThrow(/ignore source.*exceeds/u);
+      await expect(restore(ws, old)).rejects.toThrow(/ignore source.*exceeds/u);
+      expect(await readFile(path.join(ws, "a.txt"), "utf8")).toBe("keep\n");
+    } finally {
+      if (priorHome === undefined) delete process.env.HOME; else process.env.HOME = priorHome;
+      if (priorXdg === undefined) delete process.env.XDG_CONFIG_HOME; else process.env.XDG_CONFIG_HOME = priorXdg;
+      resetGitBaseEnv(); clearUserRepoCaches();
+    }
+  });
+  it("U03 stops capturing an untracked forced ignored file without ignore edits after TTL", async () => {
+    const ws = await tempDir("ws");
+    await initRepo(ws, { ".gitignore": "build/\n", "plain.txt": "ok\n" });
+    await write(ws, "build/forced.txt", "old forced\n"); userGit(ws, "add", "-f", "build/forced.txt");
+    const old = await okSnap(ws);
+    userGit(ws, "rm", "--cached", "build/forced.txt");
+    await write(ws, "build/forced.txt", "now private\n");
+    const warm = await okSnap(ws);
+    expect(shadowGit(ws, "ls-tree", "-r", "--name-only", warm.commit)).not.toContain("build/forced.txt");
+    const clock = vi.spyOn(Date, "now").mockReturnValue(Date.now() + 60_001);
+    try {
+      const current = await okSnap(ws);
+      expect(shadowGit(ws, "ls-tree", "-r", "--name-only", current.commit)).not.toContain("build/forced.txt");
+      await restore(ws, old);
+      expect(await readFile(path.join(ws, "build/forced.txt"), "utf8")).toBe("now private\n");
+      expect(await readFile(path.join(ws, ".gitignore"), "utf8")).toBe("build/\n");
+    } finally { clock.mockRestore(); }
+  });
+  it.each([false, true])("U03 reconciles removed forced membership across a cold worker without changing ignores (expired=%s)", async expired => {
+    const ws = await tempDir("ws");
+    await initRepo(ws, { ".gitignore": "build/\n", "plain.txt": "ok\n" });
+    await write(ws, "build/forced.txt", "old forced\n"); userGit(ws, "add", "-f", "build/forced.txt");
+    const old = await okSnap(ws);
+    await harness.experimental_dispose();
+    // Remove membership while the worker is down. Do not clear caches or edit
+    // ignore rules: exercise the external index stamp and persisted hash.
+    userGit(ws, "rm", "--cached", "build/forced.txt"); await write(ws, "build/forced.txt", "cold private bytes\n");
+    const userBefore = await fingerprint(path.join(ws, ".git"));
+    const clock = expired ? vi.spyOn(Date, "now").mockReturnValue(Date.now() + 60_001) : null;
+    try {
+      harness = makeHarness(dataDir, await tempDir("cold-tmp"));
+      const current = await okSnap(ws);
+      expect(shadowGit(ws, "ls-tree", "-r", "--name-only", current.commit)).not.toContain("build/forced.txt");
+      await restore(ws, old);
+      expect(await readFile(path.join(ws, "build/forced.txt"), "utf8")).toBe("cold private bytes\n");
+      expect(await readFile(path.join(ws, ".gitignore"), "utf8")).toBe("build/\n");
+      expect(await fingerprint(path.join(ws, ".git"))).toEqual(userBefore);
+    } finally { clock?.mockRestore(); }
+  });
+  it.each(["local", "global", "ancestor"])("F05 protects existing and absent targets using current ignores (%s)", async sourceKind => {
+    const root = await tempDir("ignore-root"), home = await tempDir("ignore-home");
+    const previousHome = process.env.HOME, previousXdg = process.env.XDG_CONFIG_HOME;
+    process.env.HOME = home; process.env.XDG_CONFIG_HOME = path.join(home, ".config"); resetGitBaseEnv(); clearUserRepoCaches();
+    try {
+      if (sourceKind === "ancestor") await initRepo(root, { "root.txt": "one\n" });
+      const ws = sourceKind === "ancestor" ? path.join(root, "sub") : root;
+      await write(ws, ".env", "obsolete secret\n"); await write(ws, "existing.log", "old\n");
+      const old = await okSnap(ws);
+      const source = sourceKind === "global" ? path.join(home, ".config/git/ignore") : path.join(root, ".gitignore");
+      await mkdir(path.dirname(source), { recursive: true }); await writeFile(source, ".env\n*.log\n");
+      await unlink(path.join(ws, ".env")); await write(ws, "existing.log", "keep current\n");
+      const preview = await restore(ws, old, { dryRun: true });
+      expect(preview.plan.protected.map(p => p.path)).toEqual(expect.arrayContaining([".env", "existing.log"]));
+      await restore(ws, old);
+      expect(await exists(path.join(ws, ".env"))).toBe(false);
+      expect(await readFile(path.join(ws, "existing.log"), "utf8")).toBe("keep current\n");
+    } finally {
+      if (previousHome === undefined) delete process.env.HOME; else process.env.HOME = previousHome;
+      if (previousXdg === undefined) delete process.env.XDG_CONFIG_HOME; else process.env.XDG_CONFIG_HOME = previousXdg;
+      resetGitBaseEnv(); clearUserRepoCaches();
+    }
+  });
+  it.each(["stored-policy", "legacy-policy"])("F11 revalidates unchanged indexed files after lowering the cap and protects oversized old targets (%s)", async policy => {
+    const ws = await tempDir("ws");
+    await write(ws, "large.txt", "1234567890"); await write(ws, "small.txt", "one");
+    const old = await okSnap(ws);
+    if (policy === "legacy-policy") {
+      // Persisted legacy input, not a private-method substitute: the pre-fix
+      // state format had no maxFileBytes. Recreate the public worker around it.
+      await harness.experimental_dispose();
+      const stateFile = path.join(dataDir, "shadows", shadowKey(ws), "state.json");
+      const legacy = JSON.parse(await readFile(stateFile, "utf8")); delete legacy.maxFileBytes;
+      await writeFile(stateFile, JSON.stringify(legacy));
+      harness = makeHarness(dataDir, await tempDir("legacy-tmp"));
+    }
+    const limits = { ...LIMITS, maxFileBytes: 5 };
+    const smaller = await okSnap(ws, { limits });
+    expect(smaller.skipped).toContainEqual({ path: "large.txt", reason: "too-large", sizeBytes: 10 });
+    expect(shadowGit(ws, "ls-tree", "-r", "--name-only", smaller.commit)).not.toContain("large.txt");
+    await write(ws, "large.txt", "keep new larger bytes");
+    await restore(ws, old, { limits });
+    expect(await readFile(path.join(ws, "large.txt"), "utf8")).toBe("keep new larger bytes");
+    await unlink(path.join(ws, "large.txt"));
+    await restore(ws, old, { limits });
+    expect(await exists(path.join(ws, "large.txt"))).toBe(false);
+  });
+  it.each(["directory", "gitfile"])("F04 drops unchanged indexed descendants of a new nested repository (%s) and protects old targets", async kind => {
+    const ws = await tempDir("nongit");
+    await write(ws, "lib/unchanged.txt", "old unchanged\n"); await write(ws, "lib/changed.txt", "old changed\n");
+    const old = await okSnap(ws);
+    const gitDir = kind === "gitfile" ? await tempDir("nested-git") : path.join(ws, "lib", ".git");
+    if (kind === "gitfile") userGit(path.join(ws, "lib"), "init", "-q", `--separate-git-dir=${gitDir}`);
+    else userGit(path.join(ws, "lib"), "init", "-q");
+    await write(ws, "lib/changed.txt", "nested new\n");
+    const gitBefore = await fingerprint(gitDir);
+    const gitfileBefore = kind === "gitfile" ? await readFile(path.join(ws, "lib", ".git"), "utf8") : null;
+    const current = await okSnap(ws);
+    expect(shadowGit(ws, "ls-tree", "-r", "--name-only", current.commit)).not.toContain("lib/");
+    await unlink(path.join(ws, "lib", "unchanged.txt"));
+    const result = await restore(ws, old);
+    expect(result.plan.protectedCount).toBe(2);
+    expect(await exists(path.join(ws, "lib", "unchanged.txt"))).toBe(false);
+    expect(await readFile(path.join(ws, "lib", "changed.txt"), "utf8")).toBe("nested new\n");
+    expect(await fingerprint(gitDir)).toEqual(gitBefore);
+    if (gitfileBefore !== null) expect(await readFile(path.join(ws, "lib", ".git"), "utf8")).toBe(gitfileBefore);
+  });
+  it("U01 captures external edits with inherited ignoreStat and repairs legacy flags", async () => {
+    const home = await tempDir("isolated-home");
+    await write(home, ".gitconfig", "[core]\n\tignoreStat = true\n");
+    const priorHome = process.env.HOME, priorXdg = process.env.XDG_CONFIG_HOME;
+    process.env.HOME = home; process.env.XDG_CONFIG_HOME = path.join(home, ".config"); resetGitBaseEnv();
+    try {
+      const ws = await tempDir("ws");
+      await initRepo(ws, { "a.txt": "one\n" });
+      const userIndexBefore = await fingerprint(path.join(ws, ".git"));
+      const first = await okSnap(ws);
+      await write(ws, "a.txt", "external two\n");
+      const second = await okSnap(ws);
+      expect(second.tree).not.toBe(first.tree);
+      // A released store can already carry assume-unchanged flags. Remove migration bookkeeping to model it.
+      const stateFile = path.join(dataDir, "shadows", shadowKey(ws), "state.json");
+      const state = JSON.parse(await readFile(stateFile, "utf8")); delete state.assumeUnchangedCleared;
+      await writeFile(stateFile, JSON.stringify(state));
+      shadowGit(ws, `--work-tree=${ws}`, "update-index", "--assume-unchanged", "--", "a.txt");
+      await harness.experimental_dispose(); harness = makeHarness(dataDir, await tempDir("tmp"));
+      await write(ws, "a.txt", "legacy external three\n");
+      const third = await okSnap(ws);
+      expect(third.tree).not.toBe(second.tree);
+      expect(shadowGit(ws, "ls-files", "-v")).not.toMatch(/^h /mu);
+      await restore(ws, first);
+      expect(await readFile(path.join(ws, "a.txt"), "utf8")).toBe("one\n");
+      expect(await fingerprint(path.join(ws, ".git"))).toBe(userIndexBefore);
+    } finally {
+      if (priorHome === undefined) delete process.env.HOME; else process.env.HOME = priorHome;
+      if (priorXdg === undefined) delete process.env.XDG_CONFIG_HOME; else process.env.XDG_CONFIG_HOME = priorXdg;
+      resetGitBaseEnv();
+    }
+  });
+});
 
 describe("snapshot and restore", () => {
   it.skipIf(!POSIX)("restores created, modified, deleted, renamed, chmodded, symlinked and binary files byte for byte", async () => {
@@ -964,6 +1456,42 @@ describe("workspaces that change under the snapshot", () => {
 });
 
 describe("restores that go wrong", () => {
+  it.for(["EACCES", "corrupt-store", "dangling-ref", "noncommit-ref", "malformed-ref", "unreadable-ref", "corrupt-packed", "unreadable-packed"])("U02 rejects unavailable saved Undo refs instead of reporting absence (%s)", async (failure, context) => {
+    if (!POSIX && failure.startsWith("unreadable-")) context.skip();
+    const ws = await tempDir("ws"); await write(ws, "a.txt", "old\n");
+    const old = await okSnap(ws); await write(ws, "a.txt", "before restore\n");
+    const applied = await restore(ws, old);
+    expect(await readFile(path.join(ws, "a.txt"), "utf8")).toBe("old\n");
+    const gitDir = path.join(dataDir, "shadows", shadowKey(ws), "git");
+    const lookup = { workspace: ws, checkpointId: applied.preRestoreId };
+    const saved = await harness.experimental_call("refCommit", lookup);
+    expect(saved.commit).toBe(applied.preRestore?.commit);
+    const realLstat = fsPromises.lstat;
+    let denied: { mockRestore(): void } | undefined;
+    try {
+      if (failure === "EACCES") {
+        denied = vi.spyOn(fsPromises, "lstat").mockImplementation((async (...args: Parameters<typeof realLstat>) => {
+          if (String(args[0]).startsWith(gitDir)) throw Object.assign(new Error("test shadow inaccessible"), { code: "EACCES" });
+          return realLstat(...args);
+        }) as typeof realLstat); syncBuiltinESMExports();
+      } else if (failure === "corrupt-store") await writeFile(path.join(gitDir, "HEAD"), "not a Git HEAD\n");
+      else if (failure === "unreadable-ref") await chmod(path.join(gitDir, "refs", "rewind", applied.preRestoreId), 0o000);
+      else if (failure.endsWith("-packed")) {
+        shadowGit(ws, "pack-refs", "--all", "--prune");
+        if (failure === "corrupt-packed") await writeFile(path.join(gitDir, "packed-refs"), "broken packed ref\n");
+        else await chmod(path.join(gitDir, "packed-refs"), 0o000);
+      } else await writeFile(path.join(gitDir, "refs", "rewind", applied.preRestoreId), `${failure === "malformed-ref" ? "broken" : failure === "dangling-ref" ? "f".repeat(40) : saved.tree}\n`);
+      await expect(harness.experimental_call("refCommit", lookup)).rejects.toThrow();
+    } finally {
+      denied?.mockRestore(); syncBuiltinESMExports();
+      if (failure === "unreadable-ref") await chmod(path.join(gitDir, "refs", "rewind", applied.preRestoreId), 0o644);
+      if (failure === "unreadable-packed") await chmod(path.join(gitDir, "packed-refs"), 0o644);
+    }
+  });
+  it("U02 reports authoritative absence for an uncreated shadow store", async () => {
+    const ws = await tempDir("ws");
+    expect(await harness.experimental_call("refCommit", { workspace: ws, checkpointId: newId("ck") })).toEqual({ commit: null, tree: null });
+  });
   it.skipIf(!POSIX)("reports a restore that stopped part way with an undo point that puts every file back", async () => {
     const ws = await tempDir("ws");
     await initRepo(ws, { "a.txt": "a0\n", "locked/b.txt": "b0\n" });

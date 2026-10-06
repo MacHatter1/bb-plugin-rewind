@@ -1,6 +1,6 @@
 // Restore preview + confirm, fork, and copy-id actions shared by the focus
 // card, the turn list, and the restore history.
-import { useState, type ReactNode } from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 import { toast } from "sonner";
 import { useBbNavigate } from "@get-bb/plugin-sdk/app";
 import { Button } from "@/components/ui/button";
@@ -76,6 +76,7 @@ export interface EditableMessage {
 }
 
 function PlanBody({ threadId, preview }: { threadId: string; preview: PreviewResult }) {
+  const [diffOpen, setDiffOpen] = useState(false);
   const plan = preview.plan;
   const total = plan.writes + plan.creates + plan.deletes;
   return (
@@ -88,10 +89,10 @@ function PlanBody({ threadId, preview }: { threadId: string; preview: PreviewRes
         </p>
       )}
       {total > 0 ? (
-        <details className="rounded-md border border-border px-2 py-1">
+        <details className="rounded-md border border-border px-2 py-1" onToggle={event => setDiffOpen(event.currentTarget.open)}>
           <summary className="cursor-pointer select-none py-1 text-xs text-muted-foreground">Show the changes (current files → checkpoint)</summary>
           <div className="pt-1">
-            <FileDiffs threadId={threadId} from="current" to={preview.checkpoint.id} />
+            {diffOpen ? <FileDiffs threadId={threadId} from="current" to={preview.checkpoint.id} /> : null}
           </div>
         </details>
       ) : null}
@@ -118,21 +119,20 @@ function PlanBody({ threadId, preview }: { threadId: string; preview: PreviewRes
   );
 }
 
-/** Preview of restoring `checkpoint`, with the actions. */
-export function RestorePreview({
-  threadId,
-  checkpoint,
-  anchorSeq,
-  message,
-  children,
-}: {
+interface RestorePreviewProps {
   threadId: string;
   checkpoint: CheckpointDto;
   anchorSeq?: number;
-  /** Offer "Restore files and edit this message" for this user message. */
   message?: EditableMessage;
   children?: ReactNode;
-}) {
+}
+
+/** Remount all dialogs and local text when the destructive request identity changes. */
+export function RestorePreview(props: RestorePreviewProps) {
+  return <RestorePreviewBody key={JSON.stringify([props.threadId, props.checkpoint.id, props.anchorSeq, props.message?.sourceSeqEnd])} {...props} />;
+}
+
+function RestorePreviewBody({ threadId, checkpoint, anchorSeq, message, children }: RestorePreviewProps) {
   const rpc = useRewindRpc();
   const preview = useLoadable(threadId, () => rpc.call("preview", { threadId, checkpointId: checkpoint.id }), checkpoint.id);
   const [busy, setBusy] = useState<"stopping" | "restoring" | null>(null);
@@ -140,14 +140,24 @@ export function RestorePreview({
   const [forking, setForking] = useState(false);
   const [editing, setEditing] = useState(false);
 
+  const alive = useRef(true);
+  useEffect(() => { alive.current = true; return () => { alive.current = false; }; }, []);
+  const valid = preview.data !== null && preview.data.checkpoint.id === checkpoint.id && !preview.loading && preview.error === null;
+  const validRef = useRef(valid); validRef.current = valid;
+  const requestRef = useRef(preview.requestId); requestRef.current = preview.requestId;
+  const previewRef = useRef(preview); previewRef.current = preview;
   const restore = async (stopFirst: boolean) => {
+    if (!validRef.current || !alive.current || !previewRef.current.isCurrent()) return;
+    const approvedRequest = requestRef.current;
     setBusy(stopFirst ? "stopping" : "restoring");
     try {
       if (stopFirst) {
         const { stopped } = await rpc.call("stopRunning", { threadId });
         if (stopped.length > 0) toast.info(`Stopped ${plural(stopped.length, "thread")}`);
+        if (!alive.current || !validRef.current || !previewRef.current.isCurrent() || requestRef.current !== approvedRequest) return;
         setBusy("restoring");
       }
+      if (!alive.current || !validRef.current || !previewRef.current.isCurrent() || requestRef.current !== approvedRequest) return;
       const outcome = await rpc.call("restore", { threadId, checkpointId: checkpoint.id });
       announceRestore(rpc, threadId, outcome, "Files restored");
       setConfirming(false);
@@ -158,7 +168,7 @@ export function RestorePreview({
     }
   };
 
-  const data = preview.data;
+  const data = valid ? preview.data : null;
   const running = data?.workspace.running ?? [];
   const total = data === null ? 0 : data.plan.writes + data.plan.creates + data.plan.deletes;
   return (
@@ -199,12 +209,12 @@ export function RestorePreview({
         </>
       ) : null}
       <div className="flex flex-wrap gap-2">
-        <Button size="sm" disabled={data === null || total === 0 || running.length > 0 || busy !== null} onClick={() => setConfirming(true)}>
+        <Button size="sm" disabled={data === null || total === 0 || running.length > 0 || busy !== null} onClick={() => { if (preview.isCurrent()) setConfirming(true); }}>
           <Icon name="RotateCcw" aria-hidden />
           Restore files
         </Button>
         {message !== undefined ? (
-          <Button size="sm" variant="outline" disabled={data === null || running.length > 0 || busy !== null} onClick={() => setEditing(true)}>
+          <Button size="sm" variant="outline" disabled={data === null || running.length > 0 || busy !== null} onClick={() => { if (preview.isCurrent()) setEditing(true); }}>
             <Icon name="Edit" aria-hidden />
             Restore files and edit this message
           </Button>
@@ -235,14 +245,14 @@ export function RestorePreview({
             <Button variant="ghost" disabled={busy !== null} onClick={() => setConfirming(false)}>
               Cancel
             </Button>
-            <Button disabled={busy !== null} onClick={() => void restore(false)}>
+            <Button disabled={!valid || busy !== null} onClick={() => void restore(false)}>
               {busy === "restoring" ? "Restoring…" : "Restore files"}
             </Button>
           </DialogFooter>
         </DialogContent>
       </Dialog>
       <ForkDialog threadId={threadId} checkpoint={checkpoint} {...(anchorSeq === undefined ? {} : { anchorSeq })} open={forking} onOpenChange={setForking} />
-      {message !== undefined ? <EditMessageDialog threadId={threadId} message={message} open={editing} onOpenChange={setEditing} /> : null}
+      {message !== undefined ? <EditMessageDialog key={`${threadId}:${message.sourceSeqEnd}`} threadId={threadId} message={message} open={editing && valid} onOpenChange={setEditing} valid={valid} isCurrent={preview.isCurrent} /> : null}
     </div>
   );
 }
@@ -256,9 +266,13 @@ export function EditMessageDialog({
   message,
   open,
   onOpenChange,
+  valid,
+  isCurrent,
 }: {
   threadId: string;
   message: EditableMessage;
+  valid: boolean;
+  isCurrent: () => boolean;
   open: boolean;
   onOpenChange: (open: boolean) => void;
 }) {
@@ -267,6 +281,7 @@ export function EditMessageDialog({
   const [busy, setBusy] = useState(false);
   const which = message.number === null ? "this message" : `message ${message.number}`;
   const submit = async () => {
+    if (!valid || !open || !isCurrent()) return;
     setBusy(true);
     try {
       const { outcome, edit } = await rpc.call("editMessage", { threadId, sourceSeqEnd: message.sourceSeqEnd, text });
@@ -308,7 +323,7 @@ export function EditMessageDialog({
           <Button variant="ghost" disabled={busy} onClick={() => onOpenChange(false)}>
             Cancel
           </Button>
-          <Button disabled={busy || text.trim().length === 0} onClick={() => void submit()}>
+          <Button disabled={!valid || busy || text.trim().length === 0} onClick={() => void submit()}>
             {busy ? "Restoring…" : "Restore and edit"}
           </Button>
         </DialogFooter>

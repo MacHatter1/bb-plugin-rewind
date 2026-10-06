@@ -7,7 +7,7 @@
 // (refs/rewind/<checkpointId>). Nothing here writes into the workspace except
 // `restore`, and nothing ever writes into the user's .git.
 import { createHash } from "node:crypto";
-import { access, constants as fsConstants, lstat, mkdir, open, readdir, readFile, rename, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { access, constants as fsConstants, lstat, mkdir, open, readdir, readFile, realpath, rename, rm, stat, symlink, writeFile } from "node:fs/promises";
 import path from "node:path";
 import {
   BB_CHAT_DIR,
@@ -49,6 +49,7 @@ import { indexEntryCount, parseDiffTree, parseStatusV2, splitPatch, type TreeCha
 import { actionFor, planRestore, type EntryKind } from "./plan";
 import {
   probeLayout,
+  nestedRepositoryProbe,
   readHead,
   trackedButIgnored,
   userIgnoredPaths,
@@ -66,6 +67,9 @@ const MAX_SKIP_PATHS = 500;
 
 export interface ShadowState {
   version: number;
+  assumeUnchangedCleared?: boolean;
+  maxFileBytes?: number;
+  forcedMembershipHash?: string;
   workspace: string;
   createdAt: number;
   lastUsedAt: number;
@@ -127,8 +131,9 @@ async function pathExists(target: string | Buffer): Promise<boolean> {
   try {
     await lstat(target);
     return true;
-  } catch {
-    return false;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+    throw error;
   }
 }
 
@@ -161,17 +166,29 @@ async function probeCaseInsensitive(directory: string): Promise<boolean> {
   }
 }
 
-async function mapLimit<T, R>(items: readonly T[], limit: number, fn: (item: T) => Promise<R>): Promise<R[]> {
+async function mapLimit<T, R>(items: readonly T[], limit: number, fn: (item: T) => Promise<R>, signal?: AbortSignal): Promise<R[]> {
   const results = new Array<R>(items.length);
   let next = 0;
+  let failed = false;
   const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
-    while (next < items.length) {
-      const index = next;
-      next += 1;
-      results[index] = await fn(items[index]!);
+    try {
+      while (!failed && next < items.length) {
+        signal?.throwIfAborted();
+        const index = next;
+        next += 1;
+        results[index] = await fn(items[index]!);
+        signal?.throwIfAborted();
+      }
+    } catch (error) {
+      failed = true;
+      throw error;
     }
   });
-  await Promise.all(workers);
+  // Node's stat/access calls cannot be aborted. Drain admitted I/O before
+  // releasing the workspace lock, but never admit more work after cancellation.
+  const settled = await Promise.allSettled(workers);
+  for (const result of settled) if (result.status === "rejected") throw result.reason;
+  signal?.throwIfAborted();
   return results;
 }
 
@@ -245,17 +262,21 @@ export class Shadow {
 
   /** Workspace-relative directories never captured, diffed, or restored. */
   private readonly skipDirs: string[] = [BB_CHAT_DIR];
+  private readonly absoluteSkipPaths: string[] = [];
 
   constructor(
     readonly dataDir: string,
     readonly workspace: string,
     private readonly now: () => number = Date.now,
+    private requestSignal?: AbortSignal,
   ) {
     this.key = shadowKey(workspace);
     this.root = path.join(shadowsRoot(dataDir), this.key);
     this.gitDir = path.join(this.root, "git");
     this.stateFile = path.join(this.root, "state.json");
     this.emptyExcludes = path.join(this.root, "no-excludes");
+    // Never capture our own store, including when a workspace alias changes its lexical path.
+    this.skipPaths([dataDir, shadowsRoot(dataDir)]);
   }
 
   static fromKey(dataDir: string, key: string): { root: string } {
@@ -272,6 +293,7 @@ export class Shadow {
       "core.autocrlf=false",
       "core.safecrlf=false",
       "core.fsmonitor=false",
+      "core.ignoreStat=false",
       "core.untrackedCache=false",
       "core.splitIndex=false",
       "core.sparseCheckout=false",
@@ -304,6 +326,7 @@ export class Shadow {
   git(args: readonly string[], options: Partial<GitRunOptions> = {}): Promise<GitRunResult> {
     return runGit([`--git-dir=${this.gitDir}`, `--work-tree=${this.workspace}`, "--literal-pathspecs", ...this.configArgs(), ...args], {
       cwd: this.workspace,
+      signal: this.requestSignal,
       ...options,
     });
   }
@@ -312,6 +335,7 @@ export class Shadow {
   bare(args: readonly string[], options: Partial<GitRunOptions> = {}): Promise<GitRunResult> {
     return runGit([`--git-dir=${this.gitDir}`, "--literal-pathspecs", ...this.configArgs(), ...args], {
       cwd: this.root,
+      signal: this.requestSignal,
       ...options,
     });
   }
@@ -341,6 +365,9 @@ export class Shadow {
       if (parsed.version !== STATE_VERSION) return null;
       this.state = {
         version: STATE_VERSION,
+        assumeUnchangedCleared: parsed.assumeUnchangedCleared === true,
+        ...(typeof parsed.maxFileBytes === "number" ? { maxFileBytes: parsed.maxFileBytes } : {}),
+        ...(typeof parsed.forcedMembershipHash === "string" ? { forcedMembershipHash: parsed.forcedMembershipHash } : {}),
         workspace: typeof parsed.workspace === "string" ? parsed.workspace : this.workspace,
         createdAt: typeof parsed.createdAt === "number" ? parsed.createdAt : this.now(),
         lastUsedAt: typeof parsed.lastUsedAt === "number" ? parsed.lastUsedAt : this.now(),
@@ -371,6 +398,12 @@ export class Shadow {
     if ((await this.exists()) && (await this.loadState()) !== null) {
       await this.clearStaleLocks();
       await this.rememberSkipDirs(this.state!);
+      if (this.state!.assumeUnchangedCleared !== true) {
+        const indexed = (await this.git(["ls-files", "-z", "--cached"])).stdout;
+        if (indexed.length > 0) await this.git(["update-index", "--no-assume-unchanged", "-z", "--stdin"], { input: indexed });
+        this.state!.assumeUnchangedCleared = true;
+        await this.saveState();
+      }
       return this.state!;
     }
     await mkdir(this.root, { recursive: true });
@@ -388,7 +421,7 @@ export class Shadow {
         "--template=",
         this.gitDir,
       ],
-      { cwd: this.root },
+      { cwd: this.root, signal: this.requestSignal },
     );
     await mkdir(path.join(this.gitDir, "info"), { recursive: true });
     // Store bytes exactly: no line-ending conversion, no clean/smudge filters
@@ -398,6 +431,7 @@ export class Shadow {
     await writeFile(this.emptyExcludes, "");
     this.state = {
       version: STATE_VERSION,
+      assumeUnchangedCleared: true,
       workspace: this.workspace,
       createdAt: this.now(),
       lastUsedAt: this.now(),
@@ -450,6 +484,7 @@ export class Shadow {
   skipPaths(absolute: readonly string[]): this {
     const root = path.resolve(this.workspace);
     for (const dir of absolute) {
+      this.absoluteSkipPaths.push(dir);
       const relative = path.relative(root, path.resolve(dir));
       // Never the whole workspace, and nothing outside it.
       if (relative.length === 0 || relative.startsWith("..") || path.isAbsolute(relative)) continue;
@@ -461,6 +496,35 @@ export class Shadow {
 
   /** Merge the directories remembered for this workspace with those passed now; remember new ones. */
   private async rememberSkipDirs(state: ShadowState): Promise<void> {
+    if (this.absoluteSkipPaths.length > 0) {
+      const root = await realpath(this.workspace).catch(error => {
+        // Existing bare history/imports remain usable after the working directory disappears.
+        if (["ENOENT", "ENOTDIR"].includes((error as NodeJS.ErrnoException).code ?? "")) return path.resolve(this.workspace);
+        throw error;
+      });
+      for (const absolute of this.absoluteSkipPaths) {
+        this.requestSignal?.throwIfAborted();
+        // Storage can be not-yet-created: canonicalize its nearest existing ancestor.
+        let candidate = path.resolve(absolute);
+        const suffix: string[] = [];
+        for (;;) {
+          this.requestSignal?.throwIfAborted();
+          try { candidate = path.join(await realpath(candidate), ...suffix); break; }
+          catch (error) {
+            if (!["ENOENT", "ENOTDIR"].includes((error as NodeJS.ErrnoException).code ?? "")) throw error;
+            const parent = path.dirname(candidate);
+            if (parent === candidate) throw error;
+            suffix.unshift(path.basename(candidate)); candidate = parent;
+          }
+        }
+        this.requestSignal?.throwIfAborted();
+        const relative = path.relative(root, candidate);
+        if (relative === "" || relative.startsWith("..") || path.isAbsolute(relative)) continue;
+        const internal = fromDisplay(relative.split(path.sep).join("/"));
+        if (!this.skipDirs.includes(internal)) this.skipDirs.push(internal);
+      }
+      this.absoluteSkipPaths.length = 0;
+    }
     const known = new Set(state.skipPaths);
     const fresh = this.skipDirs.map(toDisplay).filter((dir) => dir !== BB_CHAT_DIR && !known.has(dir));
     for (const dir of state.skipPaths) {
@@ -483,8 +547,9 @@ export class Shadow {
   }
 
   /** Rewrite info/exclude from the user's rules; true when it changed. */
-  private async syncExcludes(layout: RepoLayout): Promise<boolean> {
-    const sources = await userIgnoreSources(this.workspace, layout);
+  private async syncExcludes(layout: RepoLayout, signal = this.requestSignal): Promise<boolean> {
+    signal?.throwIfAborted();
+    const sources = await userIgnoreSources(this.workspace, layout, signal);
     const extra: string[] = [];
     for (const dir of this.skipDirs) {
       const pattern = anchoredPattern(toDisplay(dir), true);
@@ -498,35 +563,25 @@ export class Shadow {
     const content = composeExcludeFile(sources, extra);
     const file = path.join(this.gitDir, "info", "exclude");
     const current = await readFile(file, "utf8").catch(() => null);
+    signal?.throwIfAborted();
     if (current === content) return false;
     await writeFile(file, content);
+    signal?.throwIfAborted();
     return true;
-  }
-
-  /** Which of `paths` are in the shadow index, preserving their raw bytes. */
-  private async indexedAmong(paths: readonly string[]): Promise<Set<string>> {
-    const found = new Set<string>();
-    if (paths.length === 0) return found;
-    const wanted = new Set(paths);
-    // Batched pathspecs repeatedly scan/match the index, even for unchanged
-    // files. List it once and intersect in memory; no lossy UTF-8 argv paths.
-    const output = (await this.git(["ls-files", "-z", "--cached"])).stdout;
-    for (const record of splitNul(output)) {
-      const candidate = toInternal(record);
-      if (wanted.has(candidate)) found.add(candidate);
-    }
-    return found;
   }
 
   private absolute(relative: string): Buffer {
     return Buffer.concat([Buffer.from(path.resolve(this.workspace), "utf8"), Buffer.from("/"), internalToBuffer(relative)]);
   }
 
-  private async readable(relative: string): Promise<boolean> {
+  private async readable(relative: string, signal = this.requestSignal): Promise<boolean> {
+    signal?.throwIfAborted();
     try {
       await access(this.absolute(relative), fsConstants.R_OK);
+      signal?.throwIfAborted();
       return true;
     } catch {
+      signal?.throwIfAborted();
       return false;
     }
   }
@@ -546,14 +601,17 @@ export class Shadow {
     }
   }
 
-  private async fileKind(relative: string): Promise<{ kind: EntryKind; size: number } | null> {
+  private async fileKind(relative: string, signal = this.requestSignal): Promise<{ kind: EntryKind; size: number } | null> {
+    signal?.throwIfAborted();
     try {
       const info = await lstat(this.absolute(relative));
+      signal?.throwIfAborted();
       if (info.isSymbolicLink()) return { kind: "symlink", size: info.size };
       if (info.isFile()) return { kind: "file", size: info.size };
       if (info.isDirectory()) return { kind: "dir", size: 0 };
       return { kind: "other", size: 0 };
     } catch {
+      signal?.throwIfAborted();
       return null;
     }
   }
@@ -566,10 +624,14 @@ export class Shadow {
    * repositories are left out and reported as skipped.
    */
   async capture(options: CaptureOptions): Promise<CaptureResult> {
+    this.requestSignal?.throwIfAborted();
+    options.signal?.throwIfAborted();
     const state = await this.ensure();
-    const { limits, signal } = options;
-    const layout = await probeLayout(this.workspace, this.now());
-    const excludesChanged = await this.syncExcludes(layout);
+    const { limits } = options;
+    const signal = options.signal ?? this.requestSignal;
+    const layout = await probeLayout(this.workspace, this.now(), signal);
+    signal?.throwIfAborted();
+    const excludesChanged = await this.syncExcludes(layout, signal);
     const firstCapture = state.lastTree === null;
 
     let statusOutput: Buffer;
@@ -591,6 +653,7 @@ export class Shadow {
     const toUpdate = new Map<string, boolean>(); // path → tracked in the shadow index
     const skipped: SkippedFile[] = [];
     for (const entry of parseStatusV2(statusOutput)) {
+      signal?.throwIfAborted();
       if (this.skipped(entry.path.endsWith("/") ? entry.path.slice(0, -1) : entry.path)) continue;
       if (entry.kind === "changed") {
         if (entry.y !== ".") toUpdate.set(entry.path, true);
@@ -606,13 +669,17 @@ export class Shadow {
     }
 
     // Files the user's repository tracks despite matching an ignore rule.
-    const forced = await trackedButIgnored(this.workspace, layout, this.now());
+    const forced = await trackedButIgnored(this.workspace, layout, this.now(), signal);
+    signal?.throwIfAborted();
     const forcedSet = new Set(forced);
+    // One index walk, shared by forced membership, skip directories, nested boundaries and policy revalidation.
+    const indexedPaths = splitNul((await this.git(["ls-files", "-z", "--cached"])).stdout).map(toInternal);
+    const indexed = new Set(indexedPaths);
     if (forced.length > 0) {
-      const indexed = await this.indexedAmong(forced);
       for (const candidate of forced) {
+        signal?.throwIfAborted();
         if (this.skipped(candidate)) continue;
-        if (!indexed.has(candidate) && !toUpdate.has(candidate) && (await this.fileKind(candidate)) !== null) {
+        if (!indexed.has(candidate) && !toUpdate.has(candidate) && (await this.fileKind(candidate, signal)) !== null) {
           toUpdate.set(candidate, false);
         }
       }
@@ -621,7 +688,8 @@ export class Shadow {
     // git never untracks a file because it became ignored, but the user's
     // repository does not track it either: when the rules change, drop newly
     // ignored files from the shadow so they are neither captured nor touched.
-    const rulesChanged = excludesChanged || [...toUpdate.keys()].some((candidate) => candidate === ".gitignore" || candidate.endsWith("/.gitignore"));
+    const forcedMembershipHash = createHash("sha256").update(nulInput(forced)).digest("hex");
+    const rulesChanged = excludesChanged || forcedMembershipHash !== state.forcedMembershipHash || [...toUpdate.keys()].some((candidate) => candidate === ".gitignore" || candidate.endsWith("/.gitignore"));
     const toUntrack = new Set<string>();
     if (rulesChanged && !firstCapture) {
       const ignoredTracked = splitNul((await this.git(["ls-files", "-z", "--cached", "--ignored", "--exclude-standard"])).stdout).map(toInternal);
@@ -633,19 +701,39 @@ export class Shadow {
     }
 
     const toRemove = new Set<string>();
+    const nested = nestedRepositoryProbe(this.workspace, signal);
+    for (const candidate of new Set([...indexedPaths, ...toUpdate.keys()])) {
+      if (await nested(candidate)) {
+        toRemove.add(candidate); toUpdate.delete(candidate);
+        skipped.push({ path: candidate, reason: "nested-repository", sizeBytes: null });
+      }
+    }
     // Entries an earlier version captured in directories now left alone.
-    const stale = await this.git(["ls-files", "-z", "--cached", "--", ...this.skipDirs.map((dir) => `${toDisplay(dir)}/`)]);
-    for (const entry of splitNul(stale.stdout).map(toInternal)) {
+    for (const entry of indexedPaths) {
+      signal?.throwIfAborted();
+      if (!this.skipped(entry)) continue;
       toRemove.add(entry);
       toUpdate.delete(entry);
+    }
+    if (!firstCapture && (state.maxFileBytes === undefined || limits.maxFileBytes < state.maxFileBytes)) {
+      const sizes = await mapLimit(indexedPaths, STAT_CONCURRENCY, candidate => this.fileKind(candidate, signal), signal);
+      indexedPaths.forEach((candidate, index) => {
+        signal?.throwIfAborted();
+        const info = sizes[index];
+        if (info?.kind === "file" && info.size > limits.maxFileBytes) {
+          toRemove.add(candidate); toUpdate.delete(candidate);
+          skipped.push({ path: candidate, reason: "too-large", sizeBytes: info.size });
+        }
+      });
     }
     let newBytes = 0;
     const candidates = [...toUpdate.entries()];
     const kinds = await mapLimit(candidates, STAT_CONCURRENCY, async ([candidate]) => {
-      const info = await this.fileKind(candidate);
-      return info === null ? null : { ...info, readable: info.kind !== "file" || (await this.readable(candidate)) };
-    });
+      const info = await this.fileKind(candidate, signal);
+      return info === null ? null : { ...info, readable: info.kind !== "file" || (await this.readable(candidate, signal)) };
+    }, signal);
     candidates.forEach(([candidate, tracked], index) => {
+      signal?.throwIfAborted();
       const info = kinds[index] ?? null;
       if (info === null) return; // deleted: update-index --remove handles it
       if (info.kind === "dir" || info.kind === "other") {
@@ -698,6 +786,8 @@ export class Shadow {
     if (toUpdate.size > 0) await this.updateIndex([...toUpdate.keys()], skipped, signal);
 
     const tree = (await this.git(["write-tree"])).stdout.toString("utf8").trim();
+    state.maxFileBytes = limits.maxFileBytes;
+    state.forcedMembershipHash = forcedMembershipHash;
     return { status: "ok", tree, skipped, fileCount: await this.indexCount(), layout };
   }
 
@@ -878,16 +968,17 @@ export class Shadow {
     maxPatchBytesPerFile: number;
     maxPatchBytesTotal: number;
     limits: SnapshotLimits;
-  }): Promise<DiffResult> {
+  }, resolved?: { from: string; to: string; skipped: SkippedFile[] }): Promise<DiffResult> {
     if (!(await this.exists())) {
       if (input.from.kind === "checkpoint" || input.to.kind === "checkpoint") {
         return { status: "unavailable", reason: "This workspace has no checkpoints on this machine." };
       }
     }
     await this.ensure();
-    const from = await this.resolveRevision(input.from, input.limits);
+    this.requestSignal?.throwIfAborted();
+    const from = resolved === undefined ? await this.resolveRevision(input.from, input.limits) : { status: "ok" as const, tree: resolved.from, skipped: resolved.skipped };
     if (from.status !== "ok") return from;
-    const to = await this.resolveRevision(input.to, input.limits);
+    const to = resolved === undefined ? await this.resolveRevision(input.to, input.limits) : { status: "ok" as const, tree: resolved.to, skipped: [] };
     if (to.status !== "ok") return to;
     const paths = input.paths === null ? null : input.paths.map(fromDisplay);
     const changes = this.visible(await this.diffTrees(from.tree, to.tree, paths)).sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
@@ -945,7 +1036,7 @@ export class Shadow {
       totalFiles: changes.length,
       filesTruncated: changes.length > listed.length,
       stats: statsOf(changes),
-      skipped: displaySkipped([...from.skipped, ...to.skipped]),
+      skipped: resolved === undefined ? displaySkipped([...from.skipped, ...to.skipped]) : resolved.skipped,
     };
   }
 
@@ -1026,7 +1117,13 @@ export class Shadow {
       (await this.git(["ls-files", "-z", "--others", "--exclude-standard"], { maxOutputBytes: 1024 * 1024, truncateOutput: true })).stdout,
     )
       .map(toInternal)
-      .filter((leftover) => !skippedPaths.has(leftover) && ![...skippedPaths].some((prefix) => leftover.startsWith(`${prefix}/`)));
+      .filter((leftover) => {
+        if (skippedPaths.has(leftover)) return false;
+        for (let slash = leftover.lastIndexOf("/"); slash !== -1; slash = leftover.lastIndexOf("/", slash - 1)) {
+          if (skippedPaths.has(leftover.slice(0, slash))) return false;
+        }
+        return true;
+      });
     return {
       ok: mismatches.length === 0,
       mismatches: mismatches.slice(0, VERIFY_LIST_LIMIT),
@@ -1077,11 +1174,24 @@ export class Shadow {
     const leftAlone = allChanges.filter((change) => this.skipped(change.path));
     const changes = this.visible(allChanges);
     const layout = captured.layout;
+    const nested = nestedRepositoryProbe(this.workspace, input.signal);
+    const oversizedTargets = new Set<string>();
+    for (const entry of splitNul((await this.bare(["ls-tree", "-r", "-z", "-l", targetTree])).stdout)) {
+      const tab = entry.indexOf(9);
+      const fields = entry.subarray(0, tab).toString("ascii").trim().split(/\s+/u);
+      if (fields[0] !== "120000" && Number(fields[3]) > input.limits.maxFileBytes) oversizedTargets.add(toInternal(entry.subarray(tab + 1)));
+    }
     const plan = await planRestore(changes, {
       kind: async (candidate) => (await this.fileKind(candidate))?.kind ?? null,
       hasUncaptured: (directory) => this.hasUncaptured(directory),
-      userIgnored: (paths) => userIgnoredPaths(this.workspace, layout, paths),
+      userIgnored: async (paths) => {
+        if (layout.isGit) return userIgnoredPaths(this.workspace, layout, paths, input.signal);
+        if (paths.length === 0) return { ignored: new Set<string>(), unknown: new Set<string>() };
+        const result = await this.git(["--no-literal-pathspecs", "check-ignore", "--no-index", "-z", "--stdin"], { input: nulInput(paths), okExitCodes: [0, 1], signal: input.signal });
+        return { ignored: new Set(splitNul(result.stdout).map(toInternal)), unknown: new Set<string>() };
+      },
       caseInsensitive: state.caseInsensitive,
+      protectedPath: async candidate => oversizedTargets.has(candidate) || await nested(candidate) || ((await this.fileKind(candidate))?.size ?? 0) > input.limits.maxFileBytes,
     });
     const effectiveTree = await this.effectiveTree(targetTree, plan.dropFromTarget, [...plan.keepCurrent, ...leftAlone]);
 
@@ -1122,6 +1232,7 @@ export class Shadow {
       return { ...base, applied: false, preRestore, verification: null, applyError: "The restore was cancelled before any file changed.", durationMs: this.now() - started };
     }
 
+    this.requestSignal = undefined; // Destructive work finishes after the first write even if the request disappears.
     // From here on the undo point exists. Nothing below may throw: a failure
     // is reported with the pre-restore checkpoint so the caller can undo.
     let applied = false;
@@ -1180,10 +1291,21 @@ export class Shadow {
 
   /** The commit and tree a checkpoint's ref points at, if it exists. */
   async refCommit(checkpointId: string): Promise<{ commit: string | null; tree: string | null }> {
-    if (!(await this.exists())) return { commit: null, tree: null };
-    const result = await this.bare(["rev-parse", "-q", "--verify", `refs/rewind/${checkpointId}^{commit}`], { okExitCodes: [0, 1, 128] });
+    // A missing store/ref is authoritative absence. An inaccessible or damaged
+    // store (including missing HEAD or a ref pointing at a missing/non-commit
+    // object) is unavailable, and must preserve the server's uncertain Undo.
+    if (!(await pathExists(this.gitDir))) return { commit: null, tree: null };
+    const ref = `refs/rewind/${checkpointId}`;
+    const found = await this.bare(["show-ref", "--verify", "--quiet", ref], { okExitCodes: [0, 1] });
+    if (found.exitCode === 1) {
+      // Quiet show-ref also returns 1 for malformed/unreadable loose refs.
+      // Only a genuinely absent loose path can authorize the no-write result.
+      if (await pathExists(path.join(this.gitDir, ref))) throw new Error(`Checkpoint ref is unreadable or invalid: ${ref}`);
+      return { commit: null, tree: null };
+    }
+    const result = await this.bare(["rev-parse", "--verify", `${ref}^{commit}`]);
     const commit = result.stdout.toString("utf8").trim();
-    if (!/^[0-9a-f]{40}$/u.test(commit)) return { commit: null, tree: null };
+    if (!/^[0-9a-f]{40}$/u.test(commit)) throw new Error(`Invalid checkpoint ref: ${ref}`);
     return { commit, tree: await this.treeOf(commit) };
   }
 
@@ -1216,7 +1338,12 @@ export class Shadow {
   async deleteUnknownRefs(keep: ReadonlySet<string>, minAgeMs: number): Promise<number> {
     if (!(await this.exists())) return 0;
     const cutoff = this.now() - minAgeMs;
-    const stale = (await this.listRefs(["refs/rewind/", "refs/rewind-import/"])).filter((ref) => {
+    const stale = (await this.listRefs(["refs/rewind/", "refs/rewind-import/", "refs/rewind-comparison/"])).filter((ref) => {
+      if (ref.startsWith("refs/rewind-comparison/")) {
+        const token = ref.split("/")[2] ?? "";
+        const created = Number(token.split("-")[0]);
+        return !Number.isFinite(created) || created + 120_000 <= this.now();
+      }
       const id = ref.slice(ref.lastIndexOf("/") + 1);
       const created = idTime(id);
       if (created === null || created > cutoff) return false;

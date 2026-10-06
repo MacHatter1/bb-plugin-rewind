@@ -1,17 +1,23 @@
 // Server behaviour through the SDK's fake plugin host, with host RPC running
 // the real host handlers (real git) against temp directories.
-import { chmod, readdir, readFile } from "node:fs/promises";
+import { chmod, readdir, readFile, symlink } from "node:fs/promises";
+import fsPromises from "node:fs/promises";
+import { syncBuiltinESMExports } from "node:module";
 import path from "node:path";
 import { makeThreadResponse } from "@get-bb/plugin-sdk/testing";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import plugin from "../server";
+import { GATE_HARD_LIMIT_MS } from "../src/constants";
+import { resetGitBaseEnv } from "../src/host/git";
 import { clearUserRepoCaches } from "../src/host/user-repo";
-import type { CheckpointDto, RestoreOutcome } from "../src/rpc-contract";
+import type { CheckpointDto, RestoreOutcome, WorkspaceInfo } from "../src/rpc-contract";
 import { exists, initRepo, removeTempDirs, tempDir, userGit, write } from "./helpers/fs";
 import { createWorld, queuedRow, type World } from "./helpers/world";
 
 const worlds: World[] = [];
 afterEach(async () => {
   for (const world of worlds.splice(0)) await world.harness.lifecycle.dispose();
+  vi.restoreAllMocks();
   clearUserRepoCaches();
   await removeTempDirs();
 });
@@ -45,6 +51,316 @@ async function until(condition: () => boolean, timeoutMs = 10_000): Promise<void
     await delay(20);
   }
 }
+
+describe("review safety regressions", () => {
+  it.each(["alias", "distinct"])("F01 rechecks restore ownership after a completed snapshot response (%s)", async workspaceKind => {
+    const { world, thread, workspace } = await setup();
+    const { checkpoint } = await world.rpc<{ checkpoint: CheckpointDto }>("checkpoint", { threadId: thread.id });
+    await write(workspace, "scratch.txt", "before restore\n");
+    const siblingWorkspace = workspaceKind === "alias" ? path.join(await tempDir("alias"), "linked") : await tempDir("distinct");
+    if (workspaceKind === "alias") await symlink(workspace, siblingWorkspace, "dir");
+    else await initRepo(siblingWorkspace, { "scratch.txt": "distinct\n" });
+    const sibling = world.addThread({ environmentId: world.addEnvironment(siblingWorkspace).id });
+    let snapshotReady!: () => void, releaseSnapshot!: () => void, restoreReady!: () => void, releaseRestore!: () => void;
+    const snapshotted = new Promise<void>(resolve => { snapshotReady = resolve; });
+    const snapshotBarrier = new Promise<void>(resolve => { releaseSnapshot = resolve; });
+    const restoring = new Promise<void>(resolve => { restoreReady = resolve; });
+    const restoreBarrier = new Promise<void>(resolve => { releaseRestore = resolve; });
+    world.setAfterHostCall(async (method, input) => {
+      if (method === "snapshot" && (input as { workspace: string }).workspace === siblingWorkspace) { snapshotReady(); await snapshotBarrier; }
+    });
+    world.setBeforeHostCall(async (method, input) => {
+      if (method === "restore" && !(input as { dryRun: boolean }).dryRun) { restoreReady(); await restoreBarrier; }
+    });
+    // Timer delivery is held, not filesystem work: snapshot completion and the
+    // destructive call are deterministic barriers rather than wall-clock races.
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    const dispatch = world.dispatch(sibling);
+    let pending: Promise<RestoreOutcome> | undefined;
+    try {
+      await snapshotted;
+      pending = world.rpc<RestoreOutcome>("restore", { threadId: thread.id, checkpointId: checkpoint.id });
+      await restoring;
+      releaseSnapshot();
+      const decision = await dispatch;
+      if (decision.action === "proceed") {
+        // Model the ordinary agent turn that core is now allowed to start.
+        sibling.status = "active";
+        await write(siblingWorkspace, "scratch.txt", "ordinary agent bytes\n");
+      }
+      expect(decision).toEqual(workspaceKind === "alias" ? { action: "wait", reason: "Rewind: restoring files…", sendAt: expect.any(Number) } : { action: "proceed" });
+    } finally {
+      vi.useRealTimers(); releaseSnapshot(); releaseRestore(); await dispatch; await pending;
+      world.setAfterHostCall(undefined); world.setBeforeHostCall(undefined);
+    }
+    expect(await readFile(path.join(siblingWorkspace, "scratch.txt"), "utf8")).toBe(workspaceKind === "alias" ? "zero\n" : "ordinary agent bytes\n");
+    if (workspaceKind === "alias") expect(await world.dispatch(sibling)).toEqual({ action: "proceed" });
+  });
+  it.each([true, false])("F01 keeps a stalled-identity dispatch queued past the server hard timeout (enabled=%s)", async enabled => {
+    const { world, thread, workspace } = await setup();
+    const { checkpoint } = await world.rpc<{ checkpoint: CheckpointDto }>("checkpoint", { threadId: thread.id });
+    const alias = path.join(await tempDir("alias"), "linked"); await symlink(workspace, alias, "dir");
+    const sibling = world.addThread({ environmentId: world.addEnvironment(alias).id });
+    await world.harness.behavior.setSettings({ enabled });
+    let entered!: () => void, releaseRestore!: () => void, identified!: () => void, releaseIdentity!: () => void;
+    const restoring = new Promise<void>(r => { entered = r; }), restoreBarrier = new Promise<void>(r => { releaseRestore = r; });
+    const identifying = new Promise<void>(r => { identified = r; }), identityBarrier = new Promise<void>(r => { releaseIdentity = r; });
+    world.setBeforeHostCall(async (method, input) => {
+      if (method === "restore" && !(input as { dryRun: boolean }).dryRun) { entered(); await restoreBarrier; }
+    });
+    const pending = world.rpc("restore", { threadId: thread.id, checkpointId: checkpoint.id });
+    await restoring;
+    world.setBeforeHostCall(async method => { if (method === "identity") { identified(); await identityBarrier; } });
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    const dispatch = world.dispatch(sibling);
+    try {
+      await identifying;
+      await vi.advanceTimersByTimeAsync(GATE_HARD_LIMIT_MS);
+      expect(await dispatch).toMatchObject({ action: "wait", reason: "Rewind: restoring files…" });
+      // A failed identity is equally uncertain; it must not authorize the sibling.
+      world.setBeforeHostCall(method => { if (method === "identity") throw new Error("identity unavailable"); });
+      expect(await world.dispatch(sibling)).toMatchObject({ action: "wait", reason: "Rewind: restoring files…" });
+      await world.harness.behavior.emitThreadEvent("message.queued", { entry: queuedRow(sibling.id, { waitingOn: { kind: "plugin", pluginId: "rewind", reason: "Rewind: restoring files…" } }) });
+    } finally {
+      vi.useRealTimers(); world.setBeforeHostCall(undefined); releaseIdentity(); releaseRestore(); await dispatch; await pending;
+    }
+    // The timeout fallback must retain wait bookkeeping so completion requests a retry.
+    await until(() => world.harness.inspection.recheckCount > 1);
+    expect(await world.dispatch(sibling)).toEqual({ action: "proceed" });
+  });
+  it("F14 fails open dispatch with a clearly failed checkpoint on an oversized real ignore source", async () => {
+    const home = await tempDir("ignore-home"); await write(home, ".config/git/ignore", "#".repeat(1024 * 1024 + 10) + "\n*.secret\n");
+    const previousHome = process.env.HOME, previousXdg = process.env.XDG_CONFIG_HOME;
+    process.env.HOME = home; process.env.XDG_CONFIG_HOME = path.join(home, ".config"); resetGitBaseEnv();
+    try {
+      const { world, thread } = await setup(); await world.harness.behavior.setSettings({ gateHoldMs: 1000 });
+      expect(await world.dispatch(thread)).toEqual({ action: "proceed" });
+      const captured = await list(world, thread.id);
+      expect(captured.checkpoints.at(-1)).toMatchObject({ status: "failed", error: expect.stringMatching(/ignore source.*exceeds/u) });
+    } finally {
+      if (previousHome === undefined) delete process.env.HOME; else process.env.HOME = previousHome;
+      if (previousXdg === undefined) delete process.env.XDG_CONFIG_HOME; else process.env.XDG_CONFIG_HOME = previousXdg;
+      resetGitBaseEnv();
+    }
+  });
+  it("F02 agrees across preview restore Undo and stop for runtime-only active self at row 201", async () => {
+    const { world, thread, workspace } = await setup();
+    const { checkpoint } = await world.rpc<{ checkpoint: CheckpointDto }>("checkpoint", { threadId: thread.id });
+    await world.rpc("restore", { threadId: thread.id, checkpointId: checkpoint.id });
+    for (let i = 0; i < 200; i++) world.addThread({ environmentId: thread.environmentId });
+    world.threads.delete(thread.id); world.threads.set(thread.id, thread); thread.runtimeStatus = "starting";
+    expect((await world.rpc<{ workspace: WorkspaceInfo }>("preview", { threadId: thread.id, checkpointId: checkpoint.id })).workspace.running).toContainEqual(expect.objectContaining({ id: thread.id, status: "starting", isSelf: true }));
+    await expect(world.rpc("restore", { threadId: thread.id, checkpointId: checkpoint.id })).rejects.toThrow(/running|working/u);
+    await expect(world.rpc("undo", { threadId: thread.id })).rejects.toThrow(/running|working/u);
+    const stopped = await world.rpc<{ stopped: string[] }>("stopRunning", { threadId: thread.id });
+    expect(stopped.stopped).toContain(thread.id);
+    expect((await world.rpc<{ workspace: WorkspaceInfo }>("preview", { threadId: thread.id, checkpointId: checkpoint.id })).workspace.running).toEqual([]);
+    expect(await readFile(path.join(workspace, "scratch.txt"), "utf8")).toBe("zero\n");
+  });
+  it("U02 persists uncertain identity before a delayed restore response and survives server reload", async () => {
+    const { world, thread, workspace } = await setup();
+    const { checkpoint } = await world.rpc<{ checkpoint: CheckpointDto }>("checkpoint", { threadId: thread.id });
+    await write(workspace, "scratch.txt", "before interrupted reply\n");
+    let entered!: () => void, release!: () => void;
+    const written = new Promise<void>(r => { entered = r; }), response = new Promise<void>(r => { release = r; });
+    world.setAfterHostCall(async (method, input) => {
+      if (method === "restore" && !(input as { dryRun: boolean }).dryRun) { entered(); await response; throw new Error("lost delayed response"); }
+    });
+    const pending = world.rpc("restore", { threadId: thread.id, checkpointId: checkpoint.id }).catch(error => error);
+    await written; expect(await readFile(path.join(workspace, "scratch.txt"), "utf8")).toBe("zero\n");
+    const reloaded = await world.harness.lifecycle.reload(plugin);
+    try {
+      const listed = await reloaded.harness.behavior.callRpc("list", { threadId: thread.id }) as ListResult;
+      expect(listed.restores.at(-1)?.preRestoreCheckpointId).toBeTruthy();
+      world.setAfterHostCall(undefined); release(); await pending;
+      await reloaded.harness.behavior.callRpc("undo", { threadId: thread.id });
+      expect(await readFile(path.join(workspace, "scratch.txt"), "utf8")).toBe("before interrupted reply\n");
+    } finally { release(); await pending; await reloaded.harness.lifecycle.dispose(); }
+  });
+  it("F12 fails the bounded timeline search before any fork or prompt is sent", async () => {
+    const { world, thread } = await setup();
+    world.userMessage(thread.id, "old checkpoint without a reply");
+    const { checkpoint } = await world.rpc<{ checkpoint: CheckpointDto }>("checkpoint", { threadId: thread.id });
+    for (let i = 0; i < 3100; i++) world.userMessage(thread.id, `later ${i}`);
+    const result = await world.harness.behavior.runCli(["fork", checkpoint.id, "--thread", thread.id]);
+    expect(result.exitCode).toBe(1); expect(result.stderr + result.stdout).toMatch(/exceeds 30 timeline pages/u);
+    expect(world.harness.inspection.sdk.callsTo("threads.fork")).toHaveLength(0); expect(world.sent).toHaveLength(0);
+  });
+  it("F03 preserves offered workspace Undo even after the owner is archived", async () => {
+    const { world, thread, environment, workspace } = await setup();
+    const { checkpoint } = await world.rpc<{ checkpoint: CheckpointDto }>("checkpoint", { threadId: thread.id });
+    await write(workspace, "scratch.txt", "archived owner original\n");
+    const restored = await world.rpc<RestoreOutcome>("restore", { threadId: thread.id, checkpointId: checkpoint.id });
+    thread.archivedAt = Date.now() - 30 * 24 * 60 * 60 * 1000;
+    const sibling = world.addThread({ environmentId: environment.id });
+    await world.harness.behavior.runSchedule("retention");
+    expect((await list(world, thread.id)).checkpoints.map(c => c.id)).toContain(restored.preRestore!.id);
+    await world.rpc("undo", { threadId: sibling.id });
+    expect(await readFile(path.join(workspace, "scratch.txt"), "utf8")).toBe("archived owner original\n");
+  });
+  it("F01 preserves historical refs and workspace Undo through a symlink environment", async () => {
+    const { world, thread, workspace } = await setup();
+    const { checkpoint } = await world.rpc<{ checkpoint: CheckpointDto }>("checkpoint", { threadId: thread.id });
+    await write(workspace, "scratch.txt", "before alias Undo\n");
+    await world.rpc("restore", { threadId: thread.id, checkpointId: checkpoint.id });
+    const alias = path.join(await tempDir("alias"), "linked"); await symlink(workspace, alias, "dir");
+    const sibling = world.addThread({ environmentId: world.addEnvironment(alias).id });
+    expect(await world.rpc("diff", { threadId: sibling.id, from: checkpoint.id, to: "current" })).toMatchObject({ totalFiles: 0 });
+    await world.rpc("undo", { threadId: sibling.id });
+    expect(await readFile(path.join(workspace, "scratch.txt"), "utf8")).toBe("before alias Undo\n");
+    expect((await list(world, thread.id)).checkpoints.find(c => c.id === checkpoint.id)?.workspace).toBe(workspace);
+  });
+  it("F13 continues full raw event pages with no locally matching commands", async () => {
+    const { world, thread } = await setup({ rejectTypeFilter: true });
+    const { checkpoint } = await world.rpc<{ checkpoint: CheckpointDto }>("checkpoint", { threadId: thread.id });
+    for (let i = 0; i < 100; i++) world.appendEvent(thread.id, "unrelated/event");
+    world.command(thread.id, "git push origin main");
+    const preview = await world.rpc<{ effects: Array<{ label: string }> }>("preview", { threadId: thread.id, checkpointId: checkpoint.id });
+    expect(preview.effects.map(e => e.label)).toContain("git push");
+    expect(world.harness.inspection.sdk.callsTo("threads.events.list").filter(c => (c[0] as { afterSeq?: string }).afterSeq === "100").length).toBeGreaterThan(0);
+    const { checkpoint: newer } = await world.rpc<{ checkpoint: CheckpointDto }>("checkpoint", { threadId: thread.id });
+    const cached = await world.rpc<{ effects: Array<{ label: string }> }>("preview", { threadId: thread.id, checkpointId: checkpoint.id }); expect(cached.effects.map(e => e.label)).toContain("git push");
+    expect((await list(world, thread.id)).checkpoints.find(c => c.id === newer.id)?.effects?.map(e => e.label)).toContain("git push");
+    const shown = await world.harness.behavior.runCli(["show", newer.id], { threadId: thread.id }); expect(shown.stdout).toContain("git push");
+    const restored = await world.rpc<RestoreOutcome>("restore", { threadId: thread.id, checkpointId: checkpoint.id }); expect(restored.effects.map(e => e.label)).toContain("git push");
+  });
+  it.each(["before-turn", "after-turn", "manual"])("F12 pages old %s fork boundaries before creating a fork", async kind => {
+    let forked!: (args: Record<string, unknown>) => void;
+    const observed = new Promise<Record<string, unknown>>(r => { forked = r; });
+    const target = await tempDir("fork-target"); await initRepo(target, { "scratch.txt": "target\n" });
+    const { world, thread } = await setup({ onFork: async args => {
+      forked(args); return { id: "env_fork", hostId: "host_test", path: target, status: "ready", isGitRepo: true };
+    } });
+    const user = world.userMessage(thread.id, "old turn"); await world.dispatch(thread);
+    const reply = world.assistantMessage(thread.id, "old reply");
+    await world.harness.behavior.emitThreadEvent("thread.idle", { thread: makeThreadResponse({ id: thread.id, projectId: thread.projectId, environmentId: thread.environmentId }), lastAssistantText: "old reply" });
+    if (kind === "manual") await world.rpc("checkpoint", { threadId: thread.id });
+    const checkpoint = (await list(world, thread.id)).checkpoints.find(c => c.kind === kind)!;
+    const anchor = kind === "before-turn" ? user : reply;
+    for (let i = 0; i < 60; i++) { world.userMessage(thread.id, `new ${i}`); world.assistantMessage(thread.id, `reply ${i}`); }
+    await world.rpc("fork", { threadId: thread.id, checkpointId: checkpoint.id });
+    expect((await observed).sourceSeqEnd).toBe(anchor);
+  });
+  it("F03 retains the Undo selected after a newer no-write failure", async () => {
+    const { world, thread, workspace } = await setup({ settings: { maxCheckpointsPerThread: 10 } });
+    const { checkpoint } = await world.rpc<{ checkpoint: CheckpointDto }>("checkpoint", { threadId: thread.id });
+    await write(workspace, "scratch.txt", "must survive retention\n");
+    const success = await world.rpc<RestoreOutcome>("restore", { threadId: thread.id, checkpointId: checkpoint.id });
+    world.setBeforeHostCall(method => { if (method === "restore") throw new Error("authoritative no-write failure"); });
+    await expect(world.rpc("restore", { threadId: thread.id, checkpointId: checkpoint.id })).rejects.toThrow(/Nothing was restored/u);
+    world.setBeforeHostCall(undefined);
+    for (let i = 0; i < 12; i++) await world.rpc("checkpoint", { threadId: thread.id });
+    await world.harness.behavior.runSchedule("retention");
+    expect((await list(world, thread.id)).checkpoints.map(c => c.id)).toContain(success.preRestore!.id);
+    await world.rpc("undo", { threadId: thread.id });
+    expect(await readFile(path.join(workspace, "scratch.txt"), "utf8")).toBe("must survive retention\n");
+  });
+  it("U02 preserves real-write Undo identity when recovery hits filesystem EACCES and reconnects after reload", async () => {
+    const { world, thread, workspace } = await setup();
+    const { checkpoint } = await world.rpc<{ checkpoint: CheckpointDto }>("checkpoint", { threadId: thread.id });
+    const older = await world.rpc<RestoreOutcome>("restore", { threadId: thread.id, checkpointId: checkpoint.id });
+    await write(workspace, "scratch.txt", "before inaccessible recovery\n");
+    const realLstat = fsPromises.lstat;
+    let denied: { mockRestore(): void } | undefined;
+    world.setAfterHostCall((method, input) => {
+      if (method === "restore" && !(input as { dryRun: boolean }).dryRun) {
+        denied = vi.spyOn(fsPromises, "lstat").mockImplementation((async (...args: Parameters<typeof realLstat>) => {
+          if (String(args[0]).startsWith(path.join(world.dataDir, "shadows"))) throw Object.assign(new Error("shadow store EACCES"), { code: "EACCES" });
+          return realLstat(...args);
+        }) as typeof realLstat); syncBuiltinESMExports();
+        throw new Error("lost response after writing test files");
+      }
+    });
+    try {
+      await expect(world.rpc("restore", { threadId: thread.id, checkpointId: checkpoint.id })).rejects.toThrow(/files may have changed/u);
+      expect(await readFile(path.join(workspace, "scratch.txt"), "utf8")).toBe("zero\n");
+      const uncertain = (await list(world, thread.id)).restores.at(-1)!;
+      expect(uncertain.preRestoreCheckpointId).toBeTruthy();
+      await expect(world.rpc("undo", { threadId: thread.id, restoreId: older.restore.id })).rejects.toThrow(/latest restore is uncertain/u);
+      await expect(world.rpc("undo", { threadId: thread.id })).rejects.toThrow(/EACCES/u);
+      const reloaded = await world.harness.lifecycle.reload(plugin);
+      try {
+        const afterReload = await reloaded.harness.behavior.callRpc("list", { threadId: thread.id }) as ListResult;
+        expect(afterReload.restores.at(-1)?.preRestoreCheckpointId).toBe(uncertain.preRestoreCheckpointId);
+        await expect(reloaded.harness.behavior.callRpc("undo", { threadId: thread.id })).rejects.toThrow(/EACCES/u);
+        world.setAfterHostCall(undefined); denied?.mockRestore(); syncBuiltinESMExports();
+        await reloaded.harness.behavior.callRpc("undo", { threadId: thread.id });
+        expect(await readFile(path.join(workspace, "scratch.txt"), "utf8")).toBe("before inaccessible recovery\n");
+      } finally { await reloaded.harness.lifecycle.dispose(); }
+    } finally { world.setAfterHostCall(undefined); denied?.mockRestore(); syncBuiltinESMExports(); }
+  });
+  it("U02 recovers an uncertain real-write restore after transport loss and reload", async () => {
+    let now = Date.now(); const clock = vi.spyOn(Date, "now").mockImplementation(() => now);
+    const { world, thread, workspace } = await setup();
+    const { checkpoint } = await world.rpc<{ checkpoint: CheckpointDto }>("checkpoint", { threadId: thread.id });
+    const older = await world.rpc<RestoreOutcome>("restore", { threadId: thread.id, checkpointId: checkpoint.id });
+    await write(workspace, "scratch.txt", "original before restore\n");
+    world.setAfterHostCall((method, input) => {
+      if (method === "restore" && !(input as { dryRun: boolean }).dryRun) throw new Error("transport disconnected after writes");
+    });
+    world.setBeforeHostCall(method => { if (method === "refCommit") throw new Error("host offline"); });
+    await expect(world.rpc("restore", { threadId: thread.id, checkpointId: checkpoint.id })).rejects.toThrow(/files may have changed/u);
+    expect(await readFile(path.join(workspace, "scratch.txt"), "utf8")).toBe("zero\n");
+    expect((await list(world, thread.id)).restores.at(-1)?.preRestoreCheckpointId).toBeTruthy();
+    await expect(world.rpc("undo", { threadId: thread.id, restoreId: older.restore.id })).rejects.toThrow(/latest restore is uncertain/u);
+    await expect(world.rpc("undo", { threadId: thread.id })).rejects.toThrow(/offline/u);
+    now += 8 * 24 * 60 * 60 * 1000;
+    await world.harness.behavior.runSchedule("retention");
+    expect((await list(world, thread.id)).restores.at(-1)?.preRestoreCheckpointId).toBeTruthy();
+    world.setAfterHostCall(undefined); world.setBeforeHostCall(undefined);
+    const reloaded = await world.harness.lifecycle.reload(plugin);
+    try {
+      await reloaded.harness.behavior.callRpc("undo", { threadId: thread.id });
+      expect(await readFile(path.join(workspace, "scratch.txt"), "utf8")).toBe("original before restore\n");
+    } finally { await reloaded.harness.lifecycle.dispose(); clock.mockRestore(); }
+  });
+  it("F01 shares restore gates and active discovery across environment aliases", async () => {
+    const { world, thread, workspace } = await setup();
+    const { checkpoint } = await world.rpc<{ checkpoint: CheckpointDto }>("checkpoint", { threadId: thread.id });
+    const alias = path.join(await tempDir("alias"), "linked");
+    await symlink(workspace, alias, "dir");
+    const siblingEnv = world.addEnvironment(alias);
+    const sibling = world.addThread({ environmentId: siblingEnv.id, status: "active" });
+    await expect(world.rpc("restore", { threadId: thread.id, checkpointId: checkpoint.id })).rejects.toThrow(/running/u);
+    await world.rpc("stopRunning", { threadId: thread.id });
+    expect(sibling.status).toBe("idle");
+    await world.harness.behavior.setSettings({ enabled: false });
+    let entered!: () => void, release!: () => void;
+    const started = new Promise<void>(r => { entered = r; });
+    const barrier = new Promise<void>(r => { release = r; });
+    world.setBeforeHostCall(async (method, input) => {
+      if (method === "restore" && !(input as { dryRun: boolean }).dryRun) { entered(); await barrier; }
+    });
+    const pending = world.rpc("restore", { threadId: thread.id, checkpointId: checkpoint.id });
+    await started;
+    try {
+      expect(await world.dispatch(sibling)).toMatchObject({ action: "wait", reason: "Rewind: restoring files…" });
+      const distinctEnv = world.addEnvironment(await tempDir("different"));
+      expect(await world.dispatch(world.addThread({ environmentId: distinctEnv.id }))).toEqual({ action: "proceed" });
+      await expect(world.rpc("restore", { threadId: sibling.id, checkpointId: checkpoint.id })).rejects.toThrow(/already in progress/u);
+      sibling.status = "active";
+    } finally { release(); await pending; }
+    const restored = await pending as RestoreOutcome;
+    expect(restored.warnings).toContainEqual(expect.stringContaining(`${sibling.title} started a turn`));
+  });
+  it("F02 blocks an active sibling at row 201 and fails closed on page errors", async () => {
+    const { world, thread, environment } = await setup();
+    const { checkpoint } = await world.rpc<{ checkpoint: CheckpointDto }>("checkpoint", { threadId: thread.id });
+    for (let i = 0; i < 199; i++) world.addThread({ environmentId: environment.id });
+    const active = world.addThread({ environmentId: environment.id, status: "active" });
+    await expect(world.rpc("restore", { threadId: thread.id, checkpointId: checkpoint.id })).rejects.toThrow(/running/u);
+    expect((await list(world, thread.id)).workspace?.running.map(t => t.id)).toContain(active.id);
+    active.status = "idle"; active.runtimeStatus = "starting";
+    await expect(world.rpc("restore", { threadId: thread.id, checkpointId: checkpoint.id })).rejects.toThrow(/running/u);
+    const firstPage = await world.bb.sdk.threads.list({ environmentId: environment.id, limit: 200 });
+    world.harness.inspection.sdk.stub("threads.list", async (args: { offset?: number }) => {
+      if ((args.offset ?? 0) >= 200) throw new Error("page unavailable");
+      return firstPage;
+    });
+    await expect(world.rpc("restore", { threadId: thread.id, checkpointId: checkpoint.id })).rejects.toThrow(/page unavailable/u);
+    expect(world.hostCalls.filter(c => c.method === "restore" && !(c.input as {dryRun: boolean}).dryRun)).toHaveLength(0);
+  });
+});
 
 describe("the message.dispatch gate", () => {
   it("takes a before-turn checkpoint and proceeds", async () => {
@@ -371,7 +687,7 @@ describe("messages sent while a restore writes files", () => {
     await restoring;
   });
 
-  it("releases one at the safety cap with a warning, and warns about turns that skipped the queue", async () => {
+  it("keeps expired restore waits queued and warns about turns that skipped the queue", async () => {
     const { world, thread, checkpoint, sibling, restoreStarted } = await slowRestoreWorld();
     const restoring = world.rpc<RestoreOutcome>("restore", { threadId: thread.id, checkpointId: checkpoint.id });
     await restoreStarted;
@@ -380,13 +696,12 @@ describe("messages sent while a restore writes files", () => {
       createdAt: Date.now() - 21 * 60 * 1000,
       waitingOn: { kind: "plugin", pluginId: "rewind", reason: "Rewind: restoring files…" },
     });
-    expect(await world.dispatch(sibling, { queuedMessages: [row] })).toEqual({ action: "proceed" });
+    expect(await world.dispatch(sibling, { queuedMessages: [row] })).toMatchObject({ action: "wait", reason: "Rewind: restoring files…" });
     // Send now skips the hook; the sibling's turn starts during the restore.
     sibling.status = "active";
     const outcome = await restoring;
     expect(outcome.warnings).toEqual([
       expect.stringContaining("Sibling agent started a turn while the files were being restored"),
-      expect.stringContaining("a message to Sibling agent was sent before it finished"),
     ]);
   });
 });

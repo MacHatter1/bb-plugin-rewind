@@ -47,7 +47,7 @@ export function selectForDeletion(input: RetentionInput, failedCreatedAt: Readon
   const deleteIds: string[] = [];
   const reasons: RetentionDecision["reasons"] = {};
   const drop = (id: string, reason: RetentionDecision["reasons"][string]) => {
-    if (reasons[id] !== undefined) return;
+    if (reasons[id] !== undefined || input.protectedIds.has(id)) return;
     reasons[id] = reason;
     deleteIds.push(id);
   };

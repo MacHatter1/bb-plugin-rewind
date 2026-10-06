@@ -133,6 +133,7 @@ export const diffResultSchema = z.discriminatedUnion("status", [
       status: z.literal("ok"),
       fromTree: shaSchema,
       toTree: shaSchema,
+      comparison: z.string().max(128).optional(),
       files: z.array(diffFileSchema),
       totalFiles: z.number().int().min(0),
       filesTruncated: z.boolean(),
@@ -238,6 +239,10 @@ export const shadowInfoSchema = z
   .strict();
 
 export const hostContract = defineRpcContract({
+  identity: {
+    input: z.object({ workspace: absolutePathSchema }).strict(),
+    output: z.object({ identity: z.string(), canonicalPath: z.string() }).strict(),
+  },
   snapshot: {
     input: z
       .object({
@@ -261,6 +266,7 @@ export const hostContract = defineRpcContract({
         workspace: absolutePathSchema,
         from: revisionSchema,
         to: revisionSchema,
+        comparison: z.string().min(1).max(128).optional(),
         paths: z.array(relativePathSchema).max(200).nullable(),
         patch: z.boolean(),
         maxFiles: z.number().int().min(1).max(5_000),
@@ -272,6 +278,10 @@ export const hostContract = defineRpcContract({
       })
       .strict(),
     output: diffResultSchema,
+  },
+  releaseComparison: {
+    input: z.object({ workspace: absolutePathSchema, comparison: z.string().min(1).max(128) }).strict(),
+    output: z.object({ released: z.boolean() }).strict(),
   },
   restore: {
     input: z

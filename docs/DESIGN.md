@@ -52,8 +52,10 @@ same in non-git workspaces.
 - **Exact bytes.** `info/attributes` sets `* -text -filter -ident
   -working-tree-encoding`: no line-ending conversion, no clean/smudge
   filters (git-lfs), no `$Id$` expansion. Every command also passes
-  `-c core.autocrlf=false -c core.fsmonitor=false -c gc.auto=0 …` and the
-  case sensitivity probed from the workspace itself (without writing to it).
+  `-c core.autocrlf=false -c core.fsmonitor=false -c core.ignoreStat=false
+  -c gc.auto=0 …` and the case sensitivity probed from the workspace itself
+  (without writing to it). Legacy shadow assume-unchanged flags are cleared
+  once, recorded in shadow state; the user's index is never changed.
 - **Ignore rules match the user's git.** The work tree's `.gitignore` files
   apply natively. Everything else the user's git would apply is copied into
   the shadow's `info/exclude` on every snapshot: the repository's
@@ -64,9 +66,11 @@ same in non-git workspaces.
   applied twice with the wrong base.
 - **Tracked-but-ignored files** (force-added in the user's repository) are
   captured like any tracked file (`git ls-files -c -i --exclude-standard`,
-  read-only, cached for a minute). When ignore rules change, files that
-  became ignored are dropped from the shadow index so they are neither
-  captured nor touched.
+  read-only, cached for a minute, invalidated by the user index's filesystem
+  stamp). Changes to either ignore text or forced membership drop newly
+  ignored files from the shadow index, including an unchanged ignore file.
+  Composed ignore sources use bounded reads with a 1 MiB cap; an oversized or
+  unreadable source fails preparation explicitly, never silently truncates rules.
 - **bb's chat storage is not the user's.** bb keeps an automatically
   updated copy of each chat in the workspace (`.bb/chats/<threadId>/`:
   `thread.json`, `history/…`), and a thread's own storage can be configured
@@ -91,7 +95,11 @@ same in non-git workspaces.
   before git sees them) are skipped and reported. A captured file that grows
   past the cap, becomes unreadable, or turns into a directory is removed
   from the index, so no checkpoint claims its old content and no restore
-  overwrites what is there now.
+  overwrites what is there now. Indexed descendants are rechecked against
+  memoized nested-repository ancestors on every capture. Lowering the cap
+  triggers one indexed-file size revalidation (also for legacy state); stable
+  policy does not stat or rehash every unchanged file. Restore independently
+  protects nested boundaries and over-cap current or target entries.
 - **Unsupported workspaces.** More than 100,000 files, or more than 2 GiB
   of new or changed files in one snapshot (on the first snapshot, the whole
   workspace), marks the workspace unsupported for an hour (`status` is
@@ -103,9 +111,13 @@ same in non-git workspaces.
   (dedup: no new objects, just a ref). The shadow is self-contained: no
   alternates into the user's object store, so checkpoints survive the user's
   gc, rebases, and deleted branches.
-- **Serialized.** All git work on a workspace runs under a per-shadow mutex
-  in the host worker. Stale `index.lock` files from killed processes are
-  removed after a minute.
+- **Serialized.** Workspace operations use a host-backed canonical directory
+  identity (filesystem device/inode, canonical path fallback) for coordination,
+  so symlink/normalized aliases share locks and server restore gates. Shadow
+  addresses and historical checkpoint paths remain raw-path based; refs are not
+  moved. Configured chat-storage exclusions are canonicalized too, including
+  not-yet-created directories. Stale `index.lock` files from killed processes
+  are removed after a minute.
 - **Paths are bytes.** Host code keeps paths as latin1 "byte strings", so
   non-UTF-8 names round-trip through status, update-index, and lstat.
 
@@ -211,8 +223,11 @@ A restore is one host call under the workspace lock:
      hold such files and paths whose parent is an uncaptured file or symlink;
    - paths the user's own repository ignores (`git check-ignore`, read-only;
      it consults the user's index, so tracked files are never "ignored");
-   - existing paths git cannot check (beyond a symlink, in a submodule).
-     A missing path it cannot check is still created: nothing can be lost.
+   - paths whose ignore policy cannot be established (bounded batch isolation:
+     at most 64 Git calls and 30 seconds, with cancellation), including absent
+     creates. Only a known captured ancestor being removed allows the existing
+     symlink-transition exception. Non-Git workspaces consult current shadow
+     ignore rules for absent targets too.
 3. Build the **effective tree** (the target with protected paths dropped or
    kept at their current state) in a temporary index.
 4. `git read-tree -m -u <current> <effective>` on the shadow index, which
@@ -229,16 +244,24 @@ A restore is one host call under the workspace lock:
 overwrites ignored files and deletes ignored files inside a directory it
 replaces with a file. Step 2 exists because of that.
 
-The server refuses a restore while the thread or any thread sharing its
-environment is `starting`, `active`, or `stopping`, explains why, and the UI
+The server refuses a restore while the thread or any thread on the same host
+sharing its canonical directory is `starting`, `active`, or `stopping` in
+persisted or runtime status. It exhausts thread pages and fails closed on
+identity or page-read errors. Only one restore per canonical workspace may be
+in flight. The UI
 offers "Stop it and restore" (the CLI has `--stop-running`, and refuses to
 stop the calling agent's own thread). From just before that check until the
-files are written, every message to a thread in that environment is queued
+files are written, every message to a thread in that workspace is queued
 (`wait`, "Rewind: restoring files…"), with automatic checkpoints on or off,
 and re-attempted by `recheck` when the restore ends; its before-turn
-checkpoint then holds the restored files. There is no short limit, because
-the user started the restore; a row is released, with a warning in the
-restore's result, only after the restore host-call limit (20 minutes). A
+checkpoint then holds the restored files. A re-attempt deadline never bypasses
+an active restore: expired waits queue again, including with checkpoints off.
+Identity lookup failures during a restore queue rather than fail open. The
+server's hard deadline/exception fallback applies that same rule synchronously:
+an unresolved identity on a host with an active restore waits conservatively,
+even with checkpoints disabled, and is rechecked on completion. After async
+identity/event/snapshot waits, dispatch rechecks canonical restore ownership
+immediately before granting permission to run. A
 re-attempt another plugin triggers mid-restore is queued again. Send now,
 and turns an agent starts by itself, skip the queue; the restore's result
 warns about any turn that started meanwhile. The preview warns when git
@@ -255,6 +278,33 @@ ref. Such a restore is recorded as failed *with* its undo point: the error
 says files may have changed, and Undo, which never skips a newer partial
 restore for an older finished one, puts every file back. A restore that
 failed before changing anything has no undo point and is skipped by Undo.
+The restore/pre-checkpoint identity is persisted before the destructive host
+call. An unavailable ref lookup (including inaccessible/corrupt stores or refs) is
+not an authoritatively missing ref: uncertain outcomes keep that identity across
+reload, warn that files may have changed,
+and block selecting an older Undo. A reconnecting Undo resolves the same ref.
+The list/UI and retention use the same canonical workspace-level selection.
+
+Restore previews associate data/errors with the complete request identity;
+loading, failed, or mismatched previews disable restore/stop/edit actions.
+Target/message/thread changes remount dialogs. A pending stop continuation is
+cancelled if its accepted preview request is refreshed or replaced.
+
+Diff disclosures mount only when opened. Live lists return optional comparison
+handles: immutable tree pairs scoped to a workspace/request, at most 32 per
+worker, pinned by shadow-only refs for two minutes. Patches reuse them; explicit
+refresh/realtime invalidation requests new trees. Expired, wrong-workspace and
+cold-worker handles reject rather than silently recapture. Close/disposal
+releases pins; a new comparison sweeps cold-worker leftovers and retention
+cleans expired crash leftovers. Legacy no-handle diff calls remain valid. Host
+request cancellation reaches locks, preparation and Git processes, including
+nested-boundary probes and bounded filesystem workers. Cancellation stops new
+I/O admission; already-admitted non-abortable Node I/O drains before the
+workspace lock is released. Actual restores deliberately finish after writing
+starts. SDK 0.5.9's frontend RPC
+client has no transport-abort option; stale UI responses are discarded and
+unclaimed handles expire. Verification checks skipped slash ancestors by Set
+membership, not a skipped-path cross-product.
 
 ## Keeping the conversation in step
 
@@ -315,7 +365,10 @@ list what the undone turns (and anything since the latest checkpoint) ran;
 1. Resolve the anchor. From a message: its `sourceSeqEnd` (a user message
    branches before it, a reply after its turn). From a checkpoint (CLI): a
    before-turn checkpoint branches before the message it preceded; others
-   after the last reply they include (from `threads.timeline`).
+   after the last reply they include (from `threads.timeline`, paged backwards
+   up to 30 pages of 100 segments). Missing/unresolvable marks, broken cursors
+   or the search bound fail before creating the fork; explicit anchors retain
+   their previous behavior.
 2. `threads.fork({ sourceThreadId, sourceSeqEnd, environment: { type: "host",
    hostId, workspace: { type: "managed-worktree", baseBranch } } })` with no
    input, so the fork is created idle. The base branch is the checkpoint's
@@ -334,10 +387,13 @@ The fork runs as a background job with a status the UI polls
 
 - `thread.deleted` drops the thread's rows and refs.
 - A daily schedule (03:17 server time) keeps each thread's newest
-  `maxCheckpointsPerThread` (default 200) plus what its latest restore needs
-  for Undo, drops archived threads' checkpoints after `retentionDays`
-  (default 14) and failed attempts after a week, deletes refs the database
-  no longer knows (older than an hour, so in-flight snapshots are safe),
+  `maxCheckpointsPerThread` (default 200) plus what the latest eligible
+  canonical workspace restore needs for Undo (including partial/uncertain
+  outcomes and a success followed by a no-write failure). Those referenced
+  rows remain protected even from failed-age/archive expiry while Undo is
+  offered. Other archived threads' checkpoints expire after `retentionDays`
+  (default 14); failed attempts expire after a week. Retention also deletes
+  refs the database no longer knows (older than an hour, so in-flight snapshots are safe),
   runs `git gc --prune=2.hours.ago` outside the lock, and removes shadows of
   workspaces that no longer have an environment or any checkpoint.
 - `bb rewind prune [--dry-run]` runs it now; `--thread <id> --yes` deletes
@@ -349,7 +405,7 @@ The fork runs as a background job with a status the UI polls
 | --- | --- |
 | Gate hold (bb's dispatch lock) | `gateHoldMs` (default 200 ms, at most 2 s) plus ≤ 250 ms for the event mark; hard limit 3.5 s |
 | Message queued behind its checkpoint | 30 s (`sendAt`), then it goes |
-| Message queued behind a restore | the restore host-call limit, 20 min |
+| Message queued behind a restore | re-attempt every 20 min; never bypass an active restore |
 | File size | `maxFileSizeMB` (default 10 MB) |
 | Workspace | 100,000 files; 2 GiB of new or changed files per snapshot |
 | Stored per-checkpoint file list | 200 entries |
@@ -358,8 +414,8 @@ The fork runs as a background job with a status the UI polls
 | Agent tool output | 16 KiB |
 | Host calls | snapshot 5 min, restore 20 min (each git step 10 min), diff 2 min, gc 20 min |
 | Gate samples and queued-message records | last 1,000 each |
-| Command scan per checkpoint | `item/started` events only, 4 pages of 500; 20 effects kept |
-| Timeline read for message numbers | 20 pages of 200 segments |
+| Command scan per checkpoint | 30 pages of 100; raw page metadata retained during local type filtering; 20 effects kept |
+| Timeline read for message numbers / fork boundary | 30 pages of 100 segments |
 | Locked-file retries in a restore | 3 (0.25 s, 0.75 s, 1.5 s) |
 
 ## Measured live
