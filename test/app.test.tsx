@@ -531,21 +531,46 @@ describe("note above the message box", () => {
     expect(app.composerCustomizations.map((customization) => [customization.id, customization.scopes])).toEqual([["restore-note", ["thread"]]]);
   });
 
+  it("separates the restore status, conversation warning, and exact note preview", async () => {
+    const slot = renderBanner({ text, createdAt: NOW });
+    const card = await slot.findByRole("note", { name: "Rewind note for your next message" });
+    expect(within(card).getByRole("heading", { name: "Files restored" })).toBeTruthy();
+    expect(within(card).getByText("Chat unchanged")).toBeTruthy();
+    expect(within(card).getByText(/The chat still includes the undone turns/u)).toBeTruthy();
+    expect(within(card).getByText(text).closest("blockquote")).not.toBeNull();
+    expect(within(card).getByText("Only adds to your draft. Nothing is sent.")).toBeTruthy();
+    expect(within(card).getByRole("button", { name: "Insert note" }).getAttribute("type")).toBe("button");
+    expect(within(card).getByRole("button", { name: "Dismiss note" }).getAttribute("type")).toBe("button");
+    expect(slot.inspection.composer.text).toBe("");
+    expect(slot.inspection.composer.submits).toHaveLength(0);
+  });
+
   it("inserts the suggested note ahead of the draft, never sending it", async () => {
     const slot = renderBanner({ text, createdAt: NOW }, "and then fix the tests");
-    await slot.findByText(/Suggested note for your next message/u);
-    fireEvent.click(slot.getByRole("button", { name: "Insert" }));
+    await slot.findByText("Suggested note");
+    fireEvent.click(slot.getByRole("button", { name: "Insert note" }));
     expect(slot.inspection.composer.text).toBe(`${text}\n\nand then fix the tests`);
     await waitFor(() => expect(slot.inspection.rpcCalls.map((call) => call.method)).toContain("dismissNote"));
     expect(slot.queryByText(/Suggested note/u)).toBeNull();
     expect(slot.inspection.composer.submits).toHaveLength(0);
   });
 
-  it("can be dismissed, and shows nothing without a note", async () => {
+  it("inserts into an empty draft and focuses it without sending", async () => {
     const slot = renderBanner({ text, createdAt: NOW });
-    await slot.findByText(/Suggested note/u);
-    fireEvent.click(slot.getByRole("button", { name: "Dismiss" }));
+    fireEvent.click(await slot.findByRole("button", { name: "Insert note" }));
+    expect(slot.inspection.composer.text).toBe(text);
+    expect(slot.inspection.composer.focusCount).toBe(1);
+    expect(slot.inspection.composer.submits).toHaveLength(0);
+    await waitFor(() => expect(slot.queryByRole("note")).toBeNull());
+  });
+
+  it("can be dismissed without changing the draft, and shows nothing without a note", async () => {
+    const slot = renderBanner({ text, createdAt: NOW }, "Keep my draft");
+    await slot.findByText("Suggested note");
+    fireEvent.click(slot.getByRole("button", { name: "Dismiss note" }));
     await waitFor(() => expect(slot.queryByText(/Suggested note/u)).toBeNull());
+    expect(slot.inspection.composer.text).toBe("Keep my draft");
+    expect(slot.inspection.composer.submits).toHaveLength(0);
     const empty = renderBanner(null);
     await waitFor(() => expect(empty.inspection.rpcCalls.map((call) => call.method)).toContain("note"));
     expect(empty.container.textContent).toBe("");
