@@ -110,6 +110,13 @@ export default async function plugin(bb: BbPluginApi) {
   bb.cli.register(buildCli({ service, store, sdk: () => bb.sdk }));
   registerTools(bb.agents, service);
 
+  // Hourly, a few minutes past: drop checkpoints already past the per-thread
+  // cap. A small batch, so a backlog shrinks without a full repack.
+  bb.background.schedule("retention-incremental", "7 * * * *", async () => {
+    const result = await service.incrementalCleanup();
+    if (result.deleted > 0) bb.log.info(`incremental cleanup: deleted ${result.deleted} checkpoints`);
+  });
+
   // Daily at 03:17 server time: retention, ref reconciliation, gc.
   bb.background.schedule("retention", "17 3 * * *", async () => {
     const result = await service.retention({ dryRun: false });

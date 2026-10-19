@@ -70,7 +70,7 @@ preview lists it: tell the user those effects stay.
 | `bb rewind checkpoint [--label "…"]` | Checkpoint now. |
 | `bb rewind fork <checkpoint> [--prompt "…" \| --prompt-file f] [--title "…"]` | New thread in a new worktree, conversation cut at that point, files as they were. |
 | `bb rewind status` | Settings, message-gate latency, and this thread's state. |
-| `bb rewind prune [--dry-run]` | Apply retention now. `--thread <id> --yes` deletes one thread's checkpoints. |
+| `bb rewind prune [--dry-run]` | Apply retention now. Checkpoints past the per-thread cap are also removed as new ones are saved. `--thread <id> --yes` deletes one thread's checkpoints. |
 
 Thread-scoped commands default to the calling thread; outside a thread pass
 `--thread <thread-id>`. Every command accepts `--json`. Checkpoint ids can be

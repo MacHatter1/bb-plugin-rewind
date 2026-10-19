@@ -11,6 +11,8 @@ describe("settings", () => {
       maxCheckpointsPerThread: 200,
       retentionDays: 14,
     });
+    expect(settingsDescriptors.retentionDays.default).toBe(14);
+    expect(normalizeSettings({ retentionDays: 1 }).retentionDays).toBe(1);
     expect(DEFAULT_SETTINGS.excludedProjects.size).toBe(0);
   });
 

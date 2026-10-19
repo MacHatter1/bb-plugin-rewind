@@ -2,6 +2,7 @@
 // the real host handlers (real git) against temp directories.
 import { chmod, readdir, readFile, symlink } from "node:fs/promises";
 import fsPromises from "node:fs/promises";
+import { execFileSync } from "node:child_process";
 import { syncBuiltinESMExports } from "node:module";
 import path from "node:path";
 import { makeThreadResponse } from "@get-bb/plugin-sdk/testing";
@@ -10,8 +11,11 @@ import plugin from "../server";
 import { GATE_HARD_LIMIT_MS } from "../src/constants";
 import { resetGitBaseEnv } from "../src/host/git";
 import { clearUserRepoCaches } from "../src/host/user-repo";
+import { shadowKey } from "../src/host/shadow";
+import { newId } from "../src/ids";
+import { RewindStore } from "../src/store";
 import type { CheckpointDto, RestoreOutcome, WorkspaceInfo } from "../src/rpc-contract";
-import { exists, initRepo, removeTempDirs, tempDir, userGit, write } from "./helpers/fs";
+import { GIT_TIMEOUT_MS, exists, initRepo, removeTempDirs, tempDir, userGit, write } from "./helpers/fs";
 import { createWorld, queuedRow, type World } from "./helpers/world";
 
 const worlds: World[] = [];
@@ -74,6 +78,8 @@ describe("review safety regressions", () => {
     });
     // Timer delivery is held, not filesystem work: snapshot completion and the
     // destructive call are deterministic barriers rather than wall-clock races.
+    const queued = queuedRow(sibling.id, { waitingOn: { kind: "plugin", pluginId: "rewind", reason: "Rewind: restoring files…" } });
+    const rechecksBefore = world.harness.inspection.recheckCount;
     vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
     const dispatch = world.dispatch(sibling);
     let pending: Promise<RestoreOutcome> | undefined;
@@ -89,12 +95,19 @@ describe("review safety regressions", () => {
         await write(siblingWorkspace, "scratch.txt", "ordinary agent bytes\n");
       }
       expect(decision).toEqual(workspaceKind === "alias" ? { action: "wait", reason: "Rewind: restoring files…", sendAt: expect.any(Number) } : { action: "proceed" });
+      if (workspaceKind === "alias") await world.harness.behavior.emitThreadEvent("message.queued", { entry: queued });
     } finally {
       vi.useRealTimers(); releaseSnapshot(); releaseRestore(); await dispatch; await pending;
       world.setAfterHostCall(undefined); world.setBeforeHostCall(undefined);
     }
     expect(await readFile(path.join(siblingWorkspace, "scratch.txt"), "utf8")).toBe(workspaceKind === "alias" ? "zero\n" : "ordinary agent bytes\n");
-    if (workspaceKind === "alias") expect(await world.dispatch(sibling)).toEqual({ action: "proceed" });
+    if (workspaceKind === "alias") {
+      // Restore completion starts the held message's checkpoint in the background.
+      // Core retries after its recheck, once the restored files have been saved.
+      await until(() => world.harness.inspection.recheckCount > rechecksBefore);
+      expect((await list(world, sibling.id)).checkpoints.at(-1)).toMatchObject({ kind: "before-turn", status: "ok", late: false });
+      expect(await world.dispatch(sibling, { queuedMessages: [queued] })).toEqual({ action: "proceed" });
+    }
   });
   it.each([true, false])("F01 keeps a stalled-identity dispatch queued past the server hard timeout (enabled=%s)", async enabled => {
     const { world, thread, workspace } = await setup();
@@ -709,7 +722,20 @@ describe("messages sent while a restore writes files", () => {
 describe("restores", () => {
   async function turn(world: World, thread: { id: string }, workspace: string, change: () => Promise<void>, text: string) {
     const userSeq = world.userMessage(thread.id, text);
-    await world.dispatch(world.threads.get(thread.id)!, { input: { text, blocks: [] } });
+    const current = world.threads.get(thread.id)!;
+    const input = { text, blocks: [] };
+    let decision = await world.dispatch(current, { input });
+    if (decision.action === "wait") {
+      const queued = queuedRow(thread.id, {
+        waitingOn: { kind: "plugin", pluginId: "rewind", reason: decision.reason },
+        sendAt: decision.sendAt,
+      });
+      await world.harness.behavior.emitThreadEvent("message.queued", { entry: queued });
+      const before = (await list(world, thread.id)).checkpoints.at(-1)!;
+      await world.settled(before.id);
+      decision = await world.dispatch(current, { input, queuedMessages: [queued] });
+    }
+    expect(decision).toEqual({ action: "proceed" });
     await change();
     const replySeq = world.assistantMessage(thread.id, `done: ${text}`);
     await world.harness.behavior.emitThreadEvent("thread.idle", {
@@ -719,6 +745,15 @@ describe("restores", () => {
     void workspace;
     return { userSeq, replySeq };
   }
+
+  it("waits for a queued before-turn checkpoint before simulating agent edits", async () => {
+    const { world, thread, workspace } = await setup({ settings: { gateHoldMs: 0 } });
+    await turn(world, thread, workspace, () => write(workspace, "scratch.txt", "one\n"), "write one");
+    const before = (await list(world, thread.id)).checkpoints.find(row => row.kind === "before-turn")!;
+    await world.settled(before.id);
+    const diff = await world.rpc<{ files: Array<{ path: string }> }>("diff", { threadId: thread.id, from: before.id, to: "current" });
+    expect(diff.files.map(file => file.path)).toEqual(["scratch.txt"]);
+  });
 
   it("maps messages to checkpoints, previews, restores, and undoes", async () => {
     const { world, thread, workspace } = await setup();
@@ -1176,6 +1211,15 @@ describe("what a restore cannot undo", () => {
 });
 
 describe("lifecycle events", () => {
+  it("logs capture phase timings and identifies unchanged checkpoints", async () => {
+    const { world, thread } = await setup();
+    await world.rpc("checkpoint", { threadId: thread.id });
+    await world.rpc("checkpoint", { threadId: thread.id });
+    const messages = world.harness.inspection.logEntries.map(entry => entry.message);
+    expect(messages).toContainEqual(expect.stringMatching(/phases status \d+ms index-check \d+ms index-list \d+ms nested \d+ms update-index \d+ms write-tree \d+ms$/u));
+    expect(messages).toContainEqual(expect.stringMatching(/index-list 0ms nested 0ms update-index 0ms write-tree 0ms unchanged-fast-path$/u));
+  });
+
   it("takes a baseline when a brand-new thread starts, before its first message", async () => {
     const { world, thread } = await setup();
     const userSeq = world.userMessage(thread.id, "first");
@@ -1275,6 +1319,96 @@ describe("lifecycle events", () => {
 });
 
 describe("retention", () => {
+  /** Seed repeated saves of the same tree; retention needs history, not more captures. */
+  function seedRepeatedCheckpoints(world: World, checkpointId: string, count: number): string[] {
+    const store = new RewindStore(world.bb.storage.database());
+    const source = store.getCheckpoint(checkpointId)!;
+    const ids = Array.from({ length: count }, () => newId("ck"));
+    for (const id of ids) {
+      store.insertCheckpoint({ ...source, id });
+      store.completeCheckpoint(id, {
+        ...source,
+        commit: source.commit!,
+        tree: source.tree!,
+        baseline: false,
+        deduped: true,
+        stats: { files: 0, insertions: 0, deletions: 0 },
+        changes: [],
+        fileCount: source.fileCount!,
+        durationMs: 0,
+      }, { late: false, completedAt: source.completedAt! });
+    }
+    // Real refs keep daily reconciliation and the final Undo on the real Git path.
+    execFileSync("git", [`--git-dir=${path.join(world.dataDir, "shadows", shadowKey(source.workspace), "git")}`, "update-ref", "--stdin"], {
+      input: ids.map(id => `create refs/rewind/${id} ${source.commit}\n`).join(""),
+      timeout: GIT_TIMEOUT_MS,
+    });
+    return ids;
+  }
+
+  it("starts cleanup database work only after dispatch returns", async () => {
+    const { world, thread } = await setup({ settings: { maxCheckpointsPerThread: 20, gateHoldMs: 1_000 } });
+    for (let index = 0; index < 12; index += 1) await world.rpc("checkpoint", { threadId: thread.id });
+    await world.harness.behavior.setSettings({ maxCheckpointsPerThread: 10 });
+    const events: string[] = [];
+    const count = RewindStore.prototype.okCheckpointCount;
+    const candidates = RewindStore.prototype.retentionCheckpoints;
+    vi.spyOn(RewindStore.prototype, "okCheckpointCount").mockImplementation(function (this: RewindStore, threadId) {
+      events.push("count");
+      return count.call(this, threadId);
+    });
+    vi.spyOn(RewindStore.prototype, "retentionCheckpoints").mockImplementation(function (this: RewindStore, threadId) {
+      events.push("candidates");
+      return candidates.call(this, threadId);
+    });
+    // Keep the gate's deadline pending while real Git completes. This tests
+    // scheduling order without assuming a cold capture fits a wall-clock budget.
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    try {
+      const decision = await world.dispatch(thread).then(result => {
+        events.push("dispatch");
+        return result;
+      });
+      expect(decision).toEqual({ action: "proceed" });
+      expect(events).toEqual(["dispatch"]);
+    } finally {
+      vi.useRealTimers();
+    }
+    await until(() => events.includes("candidates"));
+    expect(events).toEqual(["dispatch", "count", "candidates"]);
+    expect((await list(world, thread.id)).checkpoints).toHaveLength(10);
+  });
+
+  it.each(["retention-incremental", "retention"])("keeps earlier Undo anchors when %s overlaps a restore that fails before writing", async schedule => {
+    const { world, thread, workspace } = await setup({ settings: { maxCheckpointsPerThread: 20 } });
+    const { checkpoint } = await world.rpc<{ checkpoint: CheckpointDto }>("checkpoint", { threadId: thread.id });
+    await write(workspace, "scratch.txt", "before original restore\n");
+    const original = await world.rpc<RestoreOutcome>("restore", { threadId: thread.id, checkpointId: checkpoint.id });
+    await write(workspace, "scratch.txt", "later checkpoint\n");
+    const { checkpoint: later } = await world.rpc<{ checkpoint: CheckpointDto }>("checkpoint", { threadId: thread.id });
+    const laterIds = [later.id, ...seedRepeatedCheckpoints(world, later.id, 11)];
+    expect((await list(world, thread.id)).checkpoints).toHaveLength(14);
+    await world.harness.behavior.setSettings({ maxCheckpointsPerThread: 10 });
+    world.setBeforeHostCall(async (method, input) => {
+      if (method === "restore" && !(input as { dryRun: boolean }).dryRun) {
+        await world.harness.behavior.runSchedule(schedule);
+        throw new Error("injected failure before restore writes");
+      }
+    });
+    try {
+      await expect(world.rpc("restore", { threadId: thread.id, checkpointId: laterIds.at(-1)! })).rejects.toThrow("Nothing was restored");
+    } finally {
+      world.setBeforeHostCall(undefined);
+    }
+    const listed = await world.rpc<ListResult & { undoRestoreId: string | null }>("list", { threadId: thread.id });
+    expect(listed.undoRestoreId).toBe(original.restore.id);
+    expect(listed.checkpoints.map(row => row.id)).toEqual(expect.arrayContaining([checkpoint.id, original.preRestore!.id]));
+    expect(listed.checkpoints.map(row => row.id)).not.toContain(laterIds[0]);
+    expect(listed.checkpoints.filter(row => laterIds.includes(row.id))).toHaveLength(10);
+    await world.rpc("undo", { threadId: thread.id });
+    expect(await readFile(path.join(workspace, "scratch.txt"), "utf8")).toBe("before original restore\n");
+  });
+
   it("keeps the newest checkpoints per thread and drops archived threads' after the retention period", async () => {
     const { world, thread, workspace, environment } = await setup({ settings: { maxCheckpointsPerThread: 10, retentionDays: 1 } });
     for (let index = 0; index < 12; index += 1) {
@@ -1284,14 +1418,53 @@ describe("retention", () => {
     const archived = world.addThread({ environmentId: environment.id, archivedAt: Date.now() - 3 * 24 * 60 * 60 * 1000 });
     await world.rpc("checkpoint", { threadId: archived.id });
 
+    // Saving past the cap already dropped the oldest two. The daily pass still
+    // owns archived threads and compaction.
+    const keptNow = (await list(world, thread.id)).checkpoints;
+    expect(keptNow.map((checkpoint) => checkpoint.label)).toEqual(["n2", "n3", "n4", "n5", "n6", "n7", "n8", "n9", "n10", "n11"]);
     const dry = await world.harness.behavior.runCli(["prune", "--dry-run", "--json"]);
-    expect(JSON.parse(dry.stdout)).toMatchObject({ deleted: 3, byReason: { "over-limit": 2, archived: 1 } });
+    expect(JSON.parse(dry.stdout)).toMatchObject({ deleted: 1, byReason: { archived: 1 } });
 
     await world.harness.behavior.runSchedule("retention");
-    const kept = (await list(world, thread.id)).checkpoints;
-    expect(kept.map((checkpoint) => checkpoint.label)).toEqual(["n2", "n3", "n4", "n5", "n6", "n7", "n8", "n9", "n10", "n11"]);
+    expect((await list(world, thread.id)).checkpoints.map((checkpoint) => checkpoint.label)).toEqual(["n2", "n3", "n4", "n5", "n6", "n7", "n8", "n9", "n10", "n11"]);
     expect((await list(world, archived.id)).checkpoints).toHaveLength(0);
     expect(world.hostCalls.filter((call) => call.method === "reconcile")).not.toHaveLength(0);
+  });
+
+  it("trims a backlog to the cap without compacting shadow repos", async () => {
+    const { world, thread, workspace } = await setup({ settings: { maxCheckpointsPerThread: 20 } });
+    for (let index = 0; index < 12; index += 1) {
+      await write(workspace, "scratch.txt", `${index}\n`);
+      await world.rpc("checkpoint", { threadId: thread.id, label: `n${index}` });
+    }
+    await world.harness.behavior.setSettings({ maxCheckpointsPerThread: 10 });
+    expect((await list(world, thread.id)).checkpoints).toHaveLength(12);
+
+    await world.harness.behavior.runSchedule("retention-incremental");
+    expect((await list(world, thread.id)).checkpoints.map((checkpoint) => checkpoint.label)).toEqual(["n2", "n3", "n4", "n5", "n6", "n7", "n8", "n9", "n10", "n11"]);
+    expect(world.hostCalls.some((call) => call.method === "deleteRefs")).toBe(true);
+    expect(world.hostCalls.filter((call) => call.method === "reconcile")).toHaveLength(0);
+  });
+
+  it("keeps the restore's undo checkpoint while trimming older points", async () => {
+    const { world, thread, workspace } = await setup({ settings: { maxCheckpointsPerThread: 10 } });
+    const ids: string[] = [];
+    for (let index = 0; index < 10; index += 1) {
+      await write(workspace, "scratch.txt", `${index}\n`);
+      const created = await world.rpc<{ checkpoint: CheckpointDto }>("checkpoint", { threadId: thread.id, label: `n${index}` });
+      ids.push(created.checkpoint.id);
+    }
+    await world.rpc("restore", { threadId: thread.id, checkpointId: ids[0] });
+    await write(workspace, "scratch.txt", "later-1\n");
+    await world.rpc("checkpoint", { threadId: thread.id, label: "later-1" });
+    await write(workspace, "scratch.txt", "later-2\n");
+    await world.rpc("checkpoint", { threadId: thread.id, label: "later-2" });
+
+    const labels = (await list(world, thread.id)).checkpoints.map((checkpoint) => checkpoint.label);
+    expect(labels).toContain("n0");
+    expect(labels).not.toContain("n1");
+    expect(labels).toContain("later-2");
+    expect(labels.some((label) => label?.startsWith("Before restoring"))).toBe(true);
   });
 
   it("removes a vanished workspace's store once no checkpoint needs it, and a dry run says so first", async () => {

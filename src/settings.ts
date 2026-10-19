@@ -36,7 +36,8 @@ export const settingsDescriptors = {
   maxCheckpointsPerThread: {
     type: "number",
     label: "Checkpoints kept per thread",
-    description: "The daily cleanup keeps this many of each thread's newest checkpoints.",
+    description:
+      "Newest checkpoints kept per thread. Older ones are removed as new checkpoints are saved. The daily cleanup also drops archived threads and compacts storage.",
     experimental_schema: z.number().int().min(10).max(5_000),
     default: 200,
   },

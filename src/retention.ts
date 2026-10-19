@@ -78,3 +78,17 @@ export function selectForDeletion(input: RetentionInput, failedCreatedAt: Readon
   }
   return { deleteIds, reasons };
 }
+
+/**
+ * The oldest over-limit checkpoints, at most `limit`. Repeated passes delete
+ * what a full retention would, oldest first, and leave archived threads,
+ * vanished threads, and expired failures for the daily pass.
+ */
+export function incrementalOverLimit(decision: RetentionDecision, checkpoints: readonly Pick<RetentionCheckpoint, "id" | "seq">[], limit: number): string[] {
+  if (limit <= 0) return [];
+  const seq = new Map(checkpoints.map((checkpoint) => [checkpoint.id, checkpoint.seq]));
+  return decision.deleteIds
+    .filter((id) => decision.reasons[id] === "over-limit")
+    .sort((a, b) => (seq.get(a) ?? 0) - (seq.get(b) ?? 0) || (a < b ? -1 : a > b ? 1 : 0))
+    .slice(0, limit);
+}

@@ -1,6 +1,7 @@
 // Rewind's server-side logic: the dispatch gate, lifecycle snapshots, message
 // mapping, restores, forks, and retention. server.ts wires it to BB; tests
 // drive it through the fake plugin host.
+import { setImmediate } from "node:timers/promises";
 import type {
   ExperimentalHostClient,
   MessageDispatchHookContext,
@@ -31,7 +32,7 @@ import {
 import { absolutePathSchema, type CheckpointKind, type HostContract, type Revision, type SnapshotLimits } from "./host-contract";
 import { newId } from "./ids";
 import { resolveMessageCheckpoint } from "./mapping";
-import { selectForDeletion } from "./retention";
+import { incrementalOverLimit, selectForDeletion } from "./retention";
 import type {
   CheckpointDto,
   ForkJob,
@@ -109,6 +110,10 @@ const EFFECT_PAGES = 30;
 const MAX_EFFECTS_PER_RANGE = 20;
 /** Checkpoints whose range a preview or restore scans inline; older ones fill in the background. */
 const EFFECT_ROWS_INLINE = 40;
+/** Oldest checkpoints dropped after one successful snapshot. Small so the workspace lock is brief. */
+const INCREMENTAL_CHECKPOINT_BATCH = 32;
+/** Oldest checkpoints one hourly pass may drop, across every thread. */
+const INCREMENTAL_PASS_LIMIT = 400;
 
 export type { EditResult } from "./format";
 
@@ -317,6 +322,8 @@ export class RewindService {
   private readonly waitByRow = new Map<string, GateWaitRow>();
   /** Effect scans in flight, so a re-list does not start the same scan twice. */
   private readonly scans = new Map<string, Promise<StoredEffect[]>>();
+  /** One incremental cleanup at a time per thread. The next pass waits for the previous. */
+  private readonly trimTails = new Map<string, Promise<number>>();
   /** Where bb keeps each thread's own storage (it never moves), and lookups that failed recently. */
   private readonly storageRoots = new Map<string, { hostId: string; path: string }>();
   private readonly storageLookups = new Map<string, Promise<{ hostId: string; path: string } | null>>();
@@ -513,6 +520,10 @@ export class RewindService {
       const completedAt = this.now();
       const late = this.releasedBefore(row.id, completedAt);
       if (result.status === "ok") {
+        const { phases } = result;
+        this.deps.log.debug(
+          `snapshot ${row.id} phases status ${phases.statusMs}ms index-check ${phases.indexCheckMs}ms index-list ${phases.indexListMs}ms nested ${phases.nestedProbeMs}ms update-index ${phases.updateIndexMs}ms write-tree ${phases.writeTreeMs}ms${phases.unchangedFastPath ? " unchanged-fast-path" : ""}`,
+        );
         updated = this.store.completeCheckpoint(
           row.id,
           { ...result, baseline: result.comparedTo === null },
@@ -537,6 +548,9 @@ export class RewindService {
     const done = updated ?? row;
     // What the commands before this checkpoint did outside the workspace.
     if (done.eventMark !== null && !this.disposed) void this.track(this.ensureEffects(done).catch(() => []));
+    // Past the cap, schedule cleanup for a later event-loop turn. Neither its
+    // database work nor its ref deletes may delay this dispatch's continuation.
+    if (done.status === "ok" && !this.disposed) void this.enqueueTrim(done.threadId);
     return done;
   }
 
@@ -1047,6 +1061,7 @@ export class RewindService {
       messageExcerpt: null,
     });
     const done = await this.runSnapshot(row);
+    await this.settleTrim(thread.id);
     // Taken after the agent started: flag it when a tool may already have run.
     const after = done.status === "ok" && !actedBefore ? await this.earlyEvents(thread.id) : null;
     if (done.status === "ok" && (actedBefore || (after !== null && RewindService.agentActed(after)))) {
@@ -1112,6 +1127,7 @@ export class RewindService {
       messageExcerpt: null,
     });
     const done = await this.runSnapshot(row);
+    await this.settleTrim(thread.id);
     if (!late || done.status !== "ok") return done;
     this.store.markLate(done.id);
     this.deps.publish(thread.id);
@@ -1175,6 +1191,7 @@ export class RewindService {
         `The checkpoint could not be taken: ${done.error ?? done.status}`,
       );
     }
+    await this.settleTrim(threadId);
     return done;
   }
 
@@ -1363,6 +1380,8 @@ export class RewindService {
       outcome = await this.applyRestore(threadId, workspace, checkpoint, sourceWorkspace, kind);
     } finally {
       this.endRestore(coordinationKey);
+      // The pre-restore checkpoint does not go through runSnapshot.
+      await this.enqueueTrim(threadId);
     }
     if (kind === "undo") {
       // Back to the files the conversation was built on: nothing to explain.
@@ -2145,6 +2164,79 @@ export class RewindService {
     }
   }
 
+  // ------------------------------------------------ incremental cleanup
+
+  /**
+   * Drop this thread's oldest checkpoints past the cap. Serialized per thread.
+   * Pending snapshots are left alone, and so is whatever any restore still
+   * needs for Undo. Archived threads, vanished threads, and expired failures
+   * stay for the daily pass, which also
+   * compacts the shadow repos.
+   */
+  private enqueueTrim(threadId: string, limit = INCREMENTAL_CHECKPOINT_BATCH): Promise<number> {
+    const previous = this.trimTails.get(threadId) ?? Promise.resolve(0);
+    const run = previous.catch(() => 0).then(async () => {
+      try {
+        // A promise microtask alone still runs before the dispatch gate's
+        // continuation. Yield before even the first synchronous database read.
+        await setImmediate();
+        return await this.trimThread(threadId, limit);
+      } catch (error) {
+        this.deps.log.info(`incremental cleanup skipped ${threadId}: ${errorText(error)}`);
+        return 0;
+      }
+    });
+    this.trimTails.set(threadId, run);
+    void this.track(
+      run.finally(() => {
+        if (this.trimTails.get(threadId) === run) this.trimTails.delete(threadId);
+      }),
+    );
+    return run;
+  }
+
+  /** Wait for the cleanup a snapshot just scheduled, when the caller is not the dispatch gate. */
+  private async settleTrim(threadId: string): Promise<void> {
+    await this.trimTails.get(threadId);
+  }
+
+  private async trimThread(threadId: string, limit: number): Promise<number> {
+    if (this.disposed || limit <= 0) return 0;
+    const settings = this.deps.settings();
+    if (this.store.okCheckpointCount(threadId) <= settings.maxCheckpointsPerThread) return 0;
+    // Pending rows are snapshots still running. The one that just finished is
+    // already "ok", so it counts toward the cap and is kept as the newest.
+    const checkpoints = this.store.retentionCheckpoints(threadId).filter((row) => row.status !== "pending");
+    const decision = selectForDeletion(
+      {
+        checkpoints,
+        threads: new Map([[threadId, { id: threadId, archivedAt: null }]]),
+        protectedIds: this.store.undoAnchorIds(),
+        maxPerThread: settings.maxCheckpointsPerThread,
+        retentionDays: settings.retentionDays,
+        now: this.now(),
+      },
+    );
+    const ids = incrementalOverLimit(decision, checkpoints, limit);
+    if (ids.length === 0) return 0;
+    // Row delete stays synchronous with the decision, so a restore that starts
+    // after this cannot lose an anchor the decision just protected.
+    const deleted = this.store.deleteCheckpoints(ids);
+    await this.deleteRefs(deleted);
+    if (deleted.length > 0) this.deps.publish(threadId);
+    return deleted.length;
+  }
+
+  /** Hourly catch-up for threads that are already over the cap, in one bounded batch. */
+  async incrementalCleanup(): Promise<{ deleted: number }> {
+    let deleted = 0;
+    for (const threadId of this.store.threadIds()) {
+      if (this.disposed || deleted >= INCREMENTAL_PASS_LIMIT) break;
+      deleted += await this.enqueueTrim(threadId, INCREMENTAL_PASS_LIMIT - deleted);
+    }
+    return { deleted };
+  }
+
   // ---------------------------------------------------------- retention
 
   async retention(options: { dryRun: boolean }): Promise<{
@@ -2171,7 +2263,7 @@ export class RewindService {
       }
     }
     const checkpoints = threadIds.flatMap((threadId) => this.store.listCheckpoints(threadId));
-    const protectedIds = new Set<string>();
+    const protectedIds = this.store.undoAnchorIds();
     for (const workspace of this.store.workspaces()) {
       // An unavailable canonical lookup must not destroy a potentially offered Undo.
       const latest = await this.latestWorkspaceRestore({ hostId: workspace.hostId, path: workspace.workspace })

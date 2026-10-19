@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { selectForDeletion, type RetentionCheckpoint } from "../../src/retention";
+import { incrementalOverLimit, selectForDeletion, type RetentionCheckpoint } from "../../src/retention";
 
 const DAY = 24 * 60 * 60 * 1000;
 const NOW = 1_800_000_000_000;
@@ -81,5 +81,37 @@ describe("retention selection", () => {
     );
     expect(decision.deleteIds).toEqual(["a-0"]);
     expect(decision.reasons["a-0"]).toBe("failed");
+  });
+});
+
+describe("incremental over-limit cleanup", () => {
+  const inputFor = (rows: RetentionCheckpoint[], protectedIds: ReadonlySet<string> = new Set()) => ({
+    checkpoints: rows,
+    threads: new Map([["a", { id: "a", archivedAt: null as number | null }]]),
+    protectedIds,
+    maxPerThread: 3,
+    retentionDays: 14,
+    now: NOW,
+  });
+
+  it("deletes the oldest excess first so the next pass continues toward the cap", () => {
+    const all = checkpoints("a", 8);
+    const first = incrementalOverLimit(selectForDeletion(inputFor(all)), all, 2);
+    expect(first).toEqual(["a-0", "a-1"]);
+    const remaining = all.filter((row) => !first.includes(row.id));
+    const second = incrementalOverLimit(selectForDeletion(inputFor(remaining)), remaining, 2);
+    expect(second).toEqual(["a-2", "a-3"]);
+    expect(remaining.filter((row) => !second.includes(row.id)).map((row) => row.id)).toEqual(["a-4", "a-5", "a-6", "a-7"]);
+  });
+
+  it("keeps an undo anchor that is older than the cap", () => {
+    const all = checkpoints("a", 6);
+    const batch = incrementalOverLimit(selectForDeletion(inputFor(all, new Set(["a-0"]))), all, 10);
+    expect(batch).toEqual(["a-1", "a-2"]);
+  });
+
+  it("returns nothing when the batch limit is zero", () => {
+    const all = checkpoints("a", 5);
+    expect(incrementalOverLimit(selectForDeletion(inputFor(all)), all, 0)).toEqual([]);
   });
 });

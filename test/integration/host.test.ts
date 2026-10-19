@@ -232,6 +232,11 @@ describe("review host regressions", () => {
     const ws = await tempDir("ws");
     for (let i = 0; i < 300; i++) await write(ws, `dir${i}/file.txt`, "old\n");
     const old = await okSnap(ws);
+    // An unchanged capture skips the nested walk until this mark expires.
+    const stateFile = path.join(dataDir, "shadows", shadowKey(ws), "state.json");
+    const saved = JSON.parse(await readFile(stateFile, "utf8")) as { nestedCleanAt?: number };
+    saved.nestedCleanAt = 0;
+    await writeFile(stateFile, JSON.stringify(saved));
     const controller = new AbortController(), realLstat = fsPromises.lstat;
     let probes = 0, afterCancellation = 0;
     const spy = vi.spyOn(fsPromises, "lstat").mockImplementation((async (...args: Parameters<typeof realLstat>) => {
@@ -703,6 +708,193 @@ describe("snapshot and restore", () => {
     const third = await okSnap(ws, { compareTo: second.commit });
     expect(third.deduped).toBe(false);
     expect(third.stats).toEqual({ files: 1, insertions: 1, deletions: 1 });
+  });
+
+  it("skips the index walk when nothing changed, and still captures a later forced-file edit", async () => {
+    const ws = await tempDir("ws");
+    await initRepo(ws, { ".gitignore": "dist/\n", "src/a.txt": "a\n", "src/b.txt": "b\n" });
+    await write(ws, "dist/bundle.js", "bundle v1\n");
+    userGit(ws, "add", "-f", "dist/bundle.js");
+    userGit(ws, "commit", "-q", "-m", "force-add bundle");
+    const first = await okSnap(ws);
+    expect(first.phases.unchangedFastPath).toBe(false);
+    for (const ms of [first.phases.statusMs, first.phases.indexCheckMs, first.phases.indexListMs, first.phases.nestedProbeMs, first.phases.updateIndexMs, first.phases.writeTreeMs]) {
+      expect(ms).toBeGreaterThanOrEqual(0);
+    }
+
+    const indexFile = path.join(dataDir, "shadows", shadowKey(ws), "git", "index");
+    const indexBefore = await readFile(indexFile);
+    const commands: string[][] = [];
+    const spawn = childProcess.spawn;
+    const spy = vi.spyOn(childProcess, "spawn").mockImplementation(((...args: Parameters<typeof spawn>) => {
+      const argv = args[1] as string[];
+      if (argv.some(arg => arg.startsWith("--git-dir="))) commands.push(argv);
+      return spawn(...args);
+    }) as typeof spawn);
+    syncBuiltinESMExports();
+    let second;
+    try {
+      second = await okSnap(ws, { compareTo: first.commit });
+    } finally {
+      spy.mockRestore(); syncBuiltinESMExports();
+    }
+    expect(second.phases.unchangedFastPath).toBe(true);
+    expect(second.phases.indexListMs).toBe(0);
+    expect(second.phases.nestedProbeMs).toBe(0);
+    expect(second.phases.writeTreeMs).toBe(0);
+    expect(second.deduped).toBe(true);
+    expect(second.tree).toBe(first.tree);
+    expect(second.fileCount).toBe(first.fileCount);
+    expect(commands.filter(argv => argv.some(arg => ["ls-files", "update-index", "write-tree"].includes(arg)))).toEqual([]);
+    expect(await readFile(indexFile)).toEqual(indexBefore);
+    expect(shadowGit(ws, "write-tree").trim()).toBe(second.tree);
+
+    await write(ws, "dist/bundle.js", "bundle v2\n");
+    const third = await okSnap(ws, { compareTo: second.commit });
+    expect(third.phases.unchangedFastPath).toBe(false);
+    expect(third.tree).not.toBe(second.tree);
+    expect(shadowGit(ws, "show", `${third.commit}:dist/bundle.js`)).toBe("bundle v2\n");
+  });
+
+  it("drops indexed files once a silent nested repository is due for recheck", async () => {
+    const ws = await tempDir("ws");
+    await initRepo(ws, { "lib/keep.txt": "keep\n", "a.txt": "a\n" });
+    const first = await okSnap(ws);
+    const second = await okSnap(ws, { compareTo: first.commit });
+    expect(second.phases.unchangedFastPath).toBe(true);
+    // Status does not report this .git. The fast path trusts the last walk
+    // until its mark expires, then the full capture removes the descendants.
+    userGit(path.join(ws, "lib"), "init", "-q");
+    const stateFile = path.join(dataDir, "shadows", shadowKey(ws), "state.json");
+    const state = JSON.parse(await readFile(stateFile, "utf8")) as { nestedCleanAt?: number };
+    state.nestedCleanAt = 0;
+    await writeFile(stateFile, JSON.stringify(state));
+    const third = await okSnap(ws);
+    expect(third.phases.unchangedFastPath).toBe(false);
+    const names = shadowGit(ws, "ls-tree", "-r", "--name-only", third.commit);
+    expect(names).not.toContain("lib/");
+    expect(names).toContain("a.txt");
+  });
+
+  it("rescans when the nested-repository mark has expired", async () => {
+    const ws = await tempDir("ws");
+    await initRepo(ws, { "a.txt": "one\n" });
+    const first = await okSnap(ws);
+    const second = await okSnap(ws, { compareTo: first.commit });
+    expect(second.phases.unchangedFastPath).toBe(true);
+    const stateFile = path.join(dataDir, "shadows", shadowKey(ws), "state.json");
+    const state = JSON.parse(await readFile(stateFile, "utf8")) as { nestedCleanAt?: number };
+    state.nestedCleanAt = 0;
+    await writeFile(stateFile, JSON.stringify(state));
+    const third = await okSnap(ws, { compareTo: second.commit });
+    expect(third.phases.unchangedFastPath).toBe(false);
+    expect(third.phases.writeTreeMs).toBe(0);
+    expect(third.deduped).toBe(true);
+    expect(third.tree).toBe(second.tree);
+  });
+
+  it("does not reuse a saved tree after the shadow index changes outside capture", async () => {
+    const ws = await tempDir("ws");
+    await initRepo(ws, { "a.txt": "one\n" });
+    const first = await okSnap(ws);
+    await write(ws, "a.txt", "two\n");
+    // Stage the edit directly: status has no worktree change, but its index
+    // no longer represents the saved tree.
+    shadowGit(ws, `--work-tree=${ws}`, "update-index", "--add", "--", "a.txt");
+    const next = await okSnap(ws, { compareTo: first.commit });
+    expect(next.phases.unchangedFastPath).toBe(false);
+    expect(next.tree).not.toBe(first.tree);
+    expect(shadowGit(ws, "show", `${next.commit}:a.txt`)).toBe("two\n");
+  });
+
+  it("checks a lowered file-count limit before reusing an unchanged capture", async () => {
+    const ws = await tempDir("ws");
+    await initRepo(ws, { "a.txt": "one\n", "b.txt": "two\n" });
+    await okSnap(ws);
+    expect((await okSnap(ws)).phases.unchangedFastPath).toBe(true);
+    const { result } = await snap(ws, { limits: { ...LIMITS, maxFiles: 1 } });
+    expect(result).toMatchObject({ status: "unsupported", fileCount: 2 });
+  });
+
+  it.each(["diff", "dry-run"])("captures edits after a %s refreshed the index without saving a checkpoint", async operation => {
+    const ws = await tempDir("ws");
+    await initRepo(ws, { "a.txt": "one\n" });
+    const first = await okSnap(ws);
+    await write(ws, "a.txt", "two\n");
+    if (operation === "dry-run") await restore(ws, first, { dryRun: true });
+    else await harness.experimental_call("diff", {
+      workspace: ws, from: { kind: "checkpoint", commit: first.commit, checkpointId: first.checkpointId },
+      to: { kind: "workspace" }, paths: null, patch: false, maxFiles: 20,
+      maxPatchBytesPerFile: 10000, maxPatchBytesTotal: 10000, limits: LIMITS,
+    });
+    const next = await okSnap(ws, { compareTo: first.commit });
+    expect(next.phases.unchangedFastPath).toBe(false);
+    expect(next.tree).not.toBe(first.tree);
+    expect(shadowGit(ws, "show", `${next.commit}:a.txt`)).toBe("two\n");
+    expect((await okSnap(ws)).phases.unchangedFastPath).toBe(true);
+  });
+
+  it("rescans after a restore before warming the unchanged path again", async () => {
+    const ws = await tempDir("ws");
+    await initRepo(ws, { "a.txt": "one\n" });
+    const first = await okSnap(ws);
+    await write(ws, "a.txt", "two\n");
+    await okSnap(ws);
+    expect((await restore(ws, first)).verification?.ok).toBe(true);
+    const next = await okSnap(ws);
+    expect(next.phases.unchangedFastPath).toBe(false);
+    expect(next.tree).toBe(first.tree);
+    expect((await okSnap(ws)).phases.unchangedFastPath).toBe(true);
+  });
+
+  it("rescans for an initially absent force-added ignored file", async () => {
+    const ws = await tempDir("ws");
+    await initRepo(ws, { ".gitignore": "dist/\n", "a.txt": "one\n" });
+    await write(ws, "dist/bundle.js", "bundle v1\n");
+    userGit(ws, "add", "-f", "dist/bundle.js");
+    userGit(ws, "commit", "-q", "-m", "force-add bundle");
+    await unlink(path.join(ws, "dist/bundle.js"));
+    await okSnap(ws);
+    expect((await okSnap(ws)).phases.unchangedFastPath).toBe(false);
+    await write(ws, "dist/bundle.js", "bundle v2\n");
+    const next = await okSnap(ws);
+    expect(next.phases.unchangedFastPath).toBe(false);
+    expect(shadowGit(ws, "show", `${next.commit}:dist/bundle.js`)).toBe("bundle v2\n");
+    expect((await okSnap(ws)).phases.unchangedFastPath).toBe(true);
+  });
+
+  it("drops newly excluded storage even when its files have not changed", async () => {
+    const ws = await tempDir("ws");
+    await initRepo(ws, { "a.txt": "one\n", "thread-store/history.json": "[]\n" });
+    const first = await okSnap(ws);
+    expect((await okSnap(ws)).phases.unchangedFastPath).toBe(true);
+    const next = await okSnap(ws, { excludePaths: [path.join(ws, "thread-store")] });
+    expect(next.phases.unchangedFastPath).toBe(false);
+    expect(next.tree).not.toBe(first.tree);
+    expect(shadowGit(ws, "ls-tree", "-r", "--name-only", next.commit)).not.toContain("thread-store/");
+    expect((await okSnap(ws)).phases.unchangedFastPath).toBe(true);
+  });
+
+  it("revalidates ignore rules after capture fails following exclude synchronization", async () => {
+    const ws = await tempDir("ws");
+    await initRepo(ws, { "a.txt": "one\n" });
+    await write(ws, "scratch.log", "previously captured\n");
+    await okSnap(ws);
+    await writeFile(path.join(ws, ".git/info/exclude"), "*.log\n");
+    const spawn = childProcess.spawn;
+    const spy = vi.spyOn(childProcess, "spawn").mockImplementation(((...args: Parameters<typeof spawn>) => {
+      if ((args[1] as string[]).includes("status")) throw new Error("capture interrupted after syncing excludes");
+      return spawn(...args);
+    }) as typeof spawn);
+    syncBuiltinESMExports();
+    try {
+      await expect(snap(ws)).rejects.toThrow("capture interrupted");
+    } finally {
+      spy.mockRestore(); syncBuiltinESMExports();
+    }
+    const next = await okSnap(ws);
+    expect(next.phases.unchangedFastPath).toBe(false);
+    expect(shadowGit(ws, "ls-tree", "-r", "--name-only", next.commit)).not.toContain("scratch.log");
   });
 
   it("keeps older comparison baselines even when the current tree is deduplicated", async () => {
