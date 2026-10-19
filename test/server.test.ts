@@ -377,24 +377,33 @@ describe("review safety regressions", () => {
 
 describe("the message.dispatch gate", () => {
   it("takes a before-turn checkpoint and proceeds", async () => {
-    const { world, thread } = await setup();
-    world.appendEvent(thread.id, "thread/started");
-    const decision = await world.dispatch(thread, { input: { text: "Refactor   the\nparser please", blocks: [] } });
-    expect(decision).toEqual({ action: "proceed" });
-    const { checkpoints } = await list(world, thread.id);
-    expect(checkpoints).toHaveLength(1);
-    expect(checkpoints[0]).toMatchObject({
-      kind: "before-turn",
-      attempt: "start-turn",
-      status: "ok",
-      late: false,
-      eventMark: 1,
-      messageExcerpt: "Refactor the parser please",
-      baseline: true,
-    });
-    const status = await world.rpc<{ gate: { snapshots: number; waits: number; heldMs: { max: number } | null } }>("status", null);
-    expect(status.gate).toMatchObject({ snapshots: 1, waits: 0 });
-    expect(status.gate.heldMs?.max).toBeLessThan(1_000);
+    // Real Git still takes the checkpoint; a controlled clock tests the gate
+    // and its timing sample independently of filesystem load.
+    vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout"] });
+    try {
+      const { world, thread } = await setup({ settings: { gateHoldMs: 200 } });
+      world.setAfterHostCall(async method => {
+        if (method === "snapshot") await vi.advanceTimersByTimeAsync(25);
+      });
+      world.appendEvent(thread.id, "thread/started");
+      const decision = await world.dispatch(thread, { input: { text: "Refactor   the\nparser please", blocks: [] } });
+      expect(decision).toEqual({ action: "proceed" });
+      const { checkpoints } = await list(world, thread.id);
+      expect(checkpoints).toHaveLength(1);
+      expect(checkpoints[0]).toMatchObject({
+        kind: "before-turn",
+        attempt: "start-turn",
+        status: "ok",
+        late: false,
+        eventMark: 1,
+        messageExcerpt: "Refactor the parser please",
+        baseline: true,
+      });
+      const status = await world.rpc<{ gate: { snapshots: number; waits: number; heldMs: { max: number } | null } }>("status", null);
+      expect(status.gate).toMatchObject({ snapshots: 1, waits: 0, heldMs: { max: 25 } });
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("fails open when git errors: the message proceeds and the checkpoint is marked failed", async () => {
