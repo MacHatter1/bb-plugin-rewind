@@ -88,6 +88,24 @@ const unsupportedSchema = z
   .strict();
 const unavailableSchema = z.object({ status: z.literal("unavailable"), reason: z.string() }).strict();
 
+/**
+ * Milliseconds spent in the capture steps that dominate a repeat snapshot.
+ * A skipped step is 0. `unchangedFastPath` means the index list, the nested
+ * repository walk, and write-tree did not run.
+ */
+export const capturePhasesSchema = z
+  .object({
+    statusMs: z.number().min(0),
+    indexCheckMs: z.number().min(0),
+    indexListMs: z.number().min(0),
+    nestedProbeMs: z.number().min(0),
+    updateIndexMs: z.number().min(0),
+    writeTreeMs: z.number().min(0),
+    unchangedFastPath: z.boolean(),
+  })
+  .strict();
+export type CapturePhases = z.infer<typeof capturePhasesSchema>;
+
 export const snapshotOkSchema = z
   .object({
     status: z.literal("ok"),
@@ -105,6 +123,7 @@ export const snapshotOkSchema = z
     head: headSchema.nullable(),
     fileCount: z.number().int().min(0),
     durationMs: z.number().min(0),
+    phases: capturePhasesSchema,
   })
   .strict();
 export type SnapshotOk = z.infer<typeof snapshotOkSchema>;

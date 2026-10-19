@@ -1,5 +1,62 @@
 # Checkpoint performance investigation
 
+## Unchanged-capture shortcut and phase timings (2026-10-19)
+
+Successful host snapshots now return monotonic millisecond timings for
+`statusMs`, `indexCheckMs`, `indexListMs`, `nestedProbeMs`, `updateIndexMs`,
+and `writeTreeMs`, plus `unchangedFastPath`. The server writes one debug log
+per successful snapshot with its checkpoint id and these phases. The opt-in
+benchmark includes the same phase object in each measurement. These are
+capture-step timings, not a breakdown of the entire dispatch gate; skipped
+steps are zero and sub-millisecond work rounds to zero. No checkpoint SQL
+queries or schema were changed for this instrumentation.
+
+After status and forced-file membership checks, an unchanged capture reuses
+the previous tree and file count without listing the index, walking nested
+repository ancestors, or running `write-tree`. This requires identical
+SHA-256 hashes of the shadow index bytes, unchanged ignore/forced membership
+and storage exclusions, compatible limits, and resident forced files.
+Missing forced files require a full scan because ignored reappearances have
+no status row. Index changes persist a dirty marker before writing; diff
+preparation, dry-run restores, interrupted writes, and older state cannot
+authorize reuse of an outdated tree. A completed restore invalidates the
+capture metadata. A full scan also uses its existing index listing for the
+file count instead of opening the index header again before updating it.
+
+The nested-repository check expires after 60 seconds. Fast captures never
+renew that timestamp, so creating a nested `.git` without a visible file edit
+is caught on the next full recheck. Restore still checks protected paths
+independently.
+
+Real-Git regression tests verify that the unchanged path leaves the index
+bytes identical and issues no shadow `ls-files`, `update-index`, or
+`write-tree`. Additional cases cover changed index bytes without a worktree
+status change, lowered file limits, forced ignored-file edits and
+reappearances, storage exclusions, expiry, diff preparation, and restores.
+
+A fresh comparison against the committed engine was attempted with 7,400
+files and 462 forced files on this machine. The baseline timed out during
+`git init`, before any snapshot was measured (the 20-second Git setup
+timeout; machine load average was over 100). No new before/after speedup
+claim is made from that run. The older measurements below describe the
+previous optimizations, not this shortcut.
+
+The plugin was rebuilt and reloaded locally. Two real checkpoints succeeded;
+the second (`ck_0mvf329qftyhzf42`) deduplicated and used the unchanged fast
+path. Its host duration was 623 ms, with status taking 360 ms and index
+listing, nested probing, index updating, and write-tree all skipped (0 ms).
+This small-workspace check verifies activation and logs under machine load;
+it is not a representative performance comparison.
+
+Verification: `npm run typecheck` and `npm run build` passed. The full run
+(`npx vitest run --maxWorkers=2 --reporter=dot`) completed with 279 passed,
+one skipped, and two timing-sensitive failures: the cross-workspace gate
+test expected a cold snapshot to finish within one second, and the locked
+restore retry test polled a path during Git's unlink/recreate window. Both
+passed on an isolated rerun with one worker and no changes to those tests.
+The subsequently added interrupted-ignore-sync regression also passed, along
+with the unchanged-path and storage-exclusion checks on the final engine.
+
 ## Implemented and reevaluated
 
 Two optimizations are implemented in `src/host/shadow.ts`:

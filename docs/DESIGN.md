@@ -88,15 +88,29 @@ same in non-git workspaces.
   of each changed path, `git update-index --add --remove --replace -z
   --stdin` for exactly those paths, `git write-tree`, `git commit-tree`,
   and one `update-ref --stdin` transaction. Only changed files are
-  re-hashed.
+  re-hashed. An unchanged capture can reuse its saved tree and file count,
+  skipping the index listing, nested-boundary walk, and `write-tree`. It
+  requires an identical SHA-256 of the shadow index bytes, unchanged ignore
+  rules and forced-file membership, every forced path already resident or
+  explicitly excluded, unchanged storage exclusions, and compatible limits.
+  Index mutations persist a dirty marker before they start; only a saved
+  checkpoint clears it. Diff preparation, dry-run restores, failed writes,
+  and legacy state therefore cannot reuse an out-of-date tree. A completed
+  restore invalidates the capture metadata for the next snapshot.
+  Successful host snapshots return phase timings for status, index hashing,
+  index listing, nested probing, file hashing/update-index, and write-tree;
+  the server logs them at debug level with the checkpoint id and a fast-path
+  marker. Timings use a monotonic clock and skipped steps report zero.
 - **Skipped, never touched.** Files over `maxFileSizeMB` (default 10) are
   never passed to git. Nested repositories (including ones without commits,
   which make `git add` abort) and unreadable files (checked with `access`
   before git sees them) are skipped and reported. A captured file that grows
   past the cap, becomes unreadable, or turns into a directory is removed
   from the index, so no checkpoint claims its old content and no restore
-  overwrites what is there now. Indexed descendants are rechecked against
-  memoized nested-repository ancestors on every capture. Lowering the cap
+  overwrites what is there now. Full captures check indexed descendants
+  against memoized nested-repository ancestors. An unchanged fast capture
+  trusts that walk for at most one minute; fast captures do not renew its
+  timestamp. Restore checks nested boundaries independently. Lowering the cap
   triggers one indexed-file size revalidation (also for legacy state); stable
   policy does not stat or rehash every unchanged file. Restore independently
   protects nested boundaries and over-cap current or target entries.
@@ -386,15 +400,23 @@ The fork runs as a background job with a status the UI polls
 ## Retention
 
 - `thread.deleted` drops the thread's rows and refs.
+- Each successful checkpoint drops that thread's oldest checkpoints past
+  `maxCheckpointsPerThread` (default 200), up to 32 per snapshot, without
+  waiting on the dispatch gate. Database work starts in a later event-loop
+  turn, after the gate's continuation. An hourly pass (minute 7) does the same for
+  threads that are already over the cap, up to 400 checkpoints in total.
+  Both protect every restore that can still be undone, including earlier
+  anchors while a newer restore's outcome is unknown. Pending snapshots are
+  not deleted. Neither pass compacts objects.
 - A daily schedule (03:17 server time) keeps each thread's newest
-  `maxCheckpointsPerThread` (default 200) plus what the latest eligible
-  canonical workspace restore needs for Undo (including partial/uncertain
-  outcomes and a success followed by a no-write failure). Those referenced
-  rows remain protected even from failed-age/archive expiry while Undo is
-  offered. Other archived threads' checkpoints expire after `retentionDays`
-  (default 14); failed attempts expire after a week. Retention also deletes
-  refs the database no longer knows (older than an hour, so in-flight snapshots are safe),
-  runs `git gc --prune=2.hours.ago` outside the lock, and removes shadows of
+  `maxCheckpointsPerThread` plus what eligible workspace
+  restores need for Undo (including partial/uncertain outcomes and a success
+  followed by a no-write failure). Those referenced rows remain protected
+  even from failed-age/archive expiry while Undo is offered. Other archived
+  threads' checkpoints expire after `retentionDays` (default 14); failed
+  attempts expire after a week. Retention also deletes refs the database no
+  longer knows (older than an hour, so in-flight snapshots are safe), runs
+  `git gc --prune=2.hours.ago` outside the lock, and removes shadows of
   workspaces that no longer have an environment or any checkpoint.
 - `bb rewind prune [--dry-run]` runs it now; `--thread <id> --yes` deletes
   one thread's checkpoints.

@@ -488,6 +488,47 @@ export class RewindStore {
     return (this.db.prepare(`SELECT DISTINCT thread_id FROM checkpoints`).all() as Raw[]).map((row) => String(row.thread_id));
   }
 
+  /** Successful checkpoints only. Pending snapshots are still in flight. */
+  okCheckpointCount(threadId: string): number {
+    const row = this.db.prepare(`SELECT COUNT(*) AS n FROM checkpoints WHERE thread_id = ? AND status = 'ok'`).get(threadId) as Raw;
+    return Number(row.n ?? 0);
+  }
+
+  /**
+   * One thread's checkpoints for retention. Metadata only: the daily and
+   * incremental passes must not load every stored diff.
+   */
+  retentionCheckpoints(threadId: string): Array<{ id: string; threadId: string; seq: number; status: CheckpointStatus; createdAt: number }> {
+    return (this.db.prepare(`SELECT rowid, id, thread_id, status, created_at FROM checkpoints WHERE thread_id = ?`).all(threadId) as Raw[]).map((row) => ({
+      id: String(row.id),
+      threadId: String(row.thread_id),
+      seq: Number(row.rowid),
+      status: String(row.status) as CheckpointStatus,
+      createdAt: Number(row.created_at),
+    }));
+  }
+
+  /**
+   * Checkpoint ids every restore that can still be undone needs. A newer
+   * provisional restore may fail before writing and reveal an earlier Undo,
+   * so it must not supersede that earlier restore's anchors during cleanup.
+   */
+  undoAnchorIds(): Set<string> {
+    const rows = this.db
+      .prepare(
+        `SELECT target_checkpoint_id, pre_restore_checkpoint_id FROM restores
+         WHERE undone_by IS NULL
+           AND (status != 'failed' OR pre_restore_checkpoint_id IS NOT NULL)`,
+      )
+      .all() as Raw[];
+    const ids = new Set<string>();
+    for (const row of rows) {
+      if (typeof row.target_checkpoint_id === "string") ids.add(row.target_checkpoint_id);
+      if (typeof row.pre_restore_checkpoint_id === "string") ids.add(row.pre_restore_checkpoint_id);
+    }
+    return ids;
+  }
+
   /** Delete checkpoint rows; returns what was deleted for ref cleanup. */
   deleteCheckpoints(ids: readonly string[]): Array<{ id: string; hostId: string; workspace: string }> {
     const deleted: Array<{ id: string; hostId: string; workspace: string }> = [];

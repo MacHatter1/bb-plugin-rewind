@@ -116,7 +116,7 @@ for (const count of sizes) {
       if (result.status !== "ok") throw new Error(JSON.stringify(result));
       expect(result.fileCount).toBe(expectedFiles);
       previous = result.commit;
-      return { ms: Math.round(ms), files: result.stats.files, deduped: result.deduped };
+      return { ms: Math.round(ms), files: result.stats.files, deduped: result.deduped, phases: result.phases };
     };
     try {
       trace.calls = [];

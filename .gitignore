@@ -4,6 +4,11 @@ node_modules/
 coverage/
 *.tsbuildinfo
 
+# Local promo assets and source
+/promo/
+/docs/rewind-promo.mp4
+/docs/screenshots/promo-poster.png
+
 # bb and agent workspace state (chat copies, notes, local settings)
 .bb/
 .claude/

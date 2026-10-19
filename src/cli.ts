@@ -426,7 +426,7 @@ export function buildCli(deps: CliDeps): PluginCliRegistration {
       prune: cliCommand({
         summary: "Apply retention now, or delete one thread's checkpoints with --thread",
         description:
-          "Without --thread, runs the daily cleanup now: keeps each thread's newest checkpoints, drops archived threads' checkpoints after the retention period, removes stores of vanished workspaces, and compacts them. With --thread, deletes every checkpoint of that thread (needs --yes).",
+          "Without --thread, runs the daily cleanup now: keeps each thread's newest checkpoints, drops archived threads' checkpoints after the retention period, removes stores of vanished workspaces, and compacts them. Checkpoints past the cap are also removed as new ones are saved. With --thread, deletes every checkpoint of that thread (needs --yes).",
         options: {
           "dry-run": { type: "boolean", description: "Report what would be deleted; delete nothing", aliases: ["dryrun"] },
           thread: { ...threadOption, description: "Delete every checkpoint of this thread (needs --yes)" },

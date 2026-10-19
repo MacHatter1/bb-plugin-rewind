@@ -174,8 +174,8 @@ sequenceDiagram
 - **Shadow repository.** Snapshots live in a separate git repository per
   workspace, in the plugin's data directory on the machine that holds the
   workspace. Your repository's `.git` is never written to.
-- **Cheap.** Only changed files are re-read. A daily cleanup keeps the
-  newest checkpoints per thread.
+- **Cheap.** Only changed files are re-read. Checkpoints past the per-thread
+  cap are removed as new ones are saved, and a daily cleanup compacts the rest.
 - **Never slows you down.** A message is held for at most `gateHoldMs`
   (200 ms by default) while its checkpoint is taken. If it takes longer,
   the message is queued with a *"Rewind: saving a checkpoint…"* card and
@@ -260,7 +260,7 @@ before risky operations and to hand restores to you.
 | `enabled` | `true` | Automatic checkpoints. Manual checkpoints, restores, and forks work either way. |
 | `gateHoldMs` | `200` | Longest a message is held for its checkpoint before it is queued instead (0–2000). |
 | `maxFileSizeMB` | `10` | Larger files are skipped and never touched. |
-| `maxCheckpointsPerThread` | `200` | Kept by the daily cleanup. |
+| `maxCheckpointsPerThread` | `200` | Newest kept per thread. Older ones are removed as new checkpoints are saved. |
 | `retentionDays` | `14` | Archived threads' checkpoints are dropped after this. |
 | `excludedProjects` | empty | Project ids or names, comma or line separated. |
 

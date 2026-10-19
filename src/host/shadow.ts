@@ -9,6 +9,7 @@
 import { createHash } from "node:crypto";
 import { access, constants as fsConstants, lstat, mkdir, open, readdir, readFile, realpath, rename, rm, stat, symlink, writeFile } from "node:fs/promises";
 import path from "node:path";
+import { performance } from "node:perf_hooks";
 import {
   BB_CHAT_DIR,
   EMPTY_TREE,
@@ -17,6 +18,7 @@ import {
   UNSUPPORTED_RECHECK_MS,
 } from "../constants";
 import type {
+  CapturePhases,
   ChangeStats,
   DiffFile,
   DiffResult,
@@ -62,6 +64,12 @@ const SHADOWS_DIR = "shadows";
 const NULL_SHA = "0000000000000000000000000000000000000000";
 const STAT_CONCURRENCY = 32;
 const MAX_UPDATE_RETRIES = 8;
+/**
+ * How long an unchanged capture may trust the last nested-repository walk.
+ * The fast path does not refresh this mark, so a busy thread rechecks after
+ * the interval instead of walking forever on a stale "clean".
+ */
+const NESTED_RECHECK_MS = 60_000;
 const VERIFY_LIST_LIMIT = 50;
 const MAX_SKIP_PATHS = 500;
 
@@ -76,6 +84,23 @@ export interface ShadowState {
   lastSnapshotAt: number | null;
   lastTree: string | null;
   lastCommit: string | null;
+  /** Hash of the index bytes used for the saved tree, not just its entry count. */
+  lastIndexHash?: string;
+  /** Index entries after the last full capture. Absent until one has finished. */
+  lastFileCount?: number;
+  /**
+   * True when every force-added path was already in the index (or left alone).
+   * A missing forced file must not take the fast path: status will not list it
+   * when the ignore rules hide it, so the next full scan has to notice it appear.
+   */
+  forcedResident?: boolean;
+  /** Last nested-repository walk that left the index clean. See NESTED_RECHECK_MS. */
+  nestedCleanAt?: number;
+  /**
+   * The index was changed, or is about to be, and no saved tree matches it yet.
+   * Set before update-index or read-tree and cleared only when that tree is saved.
+   */
+  indexDiverged?: boolean;
   caseInsensitive: boolean;
   /** This process can create symlinks (Windows needs a privilege or Developer Mode). */
   symlinks: boolean;
@@ -214,6 +239,17 @@ function toFileChange(change: TreeChange): FileChange {
   };
 }
 
+function phaseMs(started: number): number {
+  return Math.max(0, Math.round(performance.now() - started));
+}
+
+function touchesGitignore(paths: Iterable<string>): boolean {
+  for (const candidate of paths) {
+    if (candidate === ".gitignore" || candidate.endsWith("/.gitignore")) return true;
+  }
+  return false;
+}
+
 function sizeLabel(bytes: number): string {
   if (bytes >= 1024 ** 3) return `${Number((bytes / 1024 ** 3).toFixed(1))} GB`;
   if (bytes >= 1024 ** 2) return `${Number((bytes / 1024 ** 2).toFixed(1))} MB`;
@@ -244,7 +280,7 @@ export function parseUnprocessablePath(stderr: string): string | null {
 }
 
 type CaptureResult =
-  | { status: "ok"; tree: string; skipped: SkippedFile[]; fileCount: number; layout: RepoLayout }
+  | { status: "ok"; tree: string; skipped: SkippedFile[]; fileCount: number; layout: RepoLayout; phases: CapturePhases }
   | { status: "unsupported"; reason: string; fileCount: number | null; totalBytes: number | null };
 
 interface CaptureOptions {
@@ -374,6 +410,11 @@ export class Shadow {
         lastSnapshotAt: typeof parsed.lastSnapshotAt === "number" ? parsed.lastSnapshotAt : null,
         lastTree: typeof parsed.lastTree === "string" ? parsed.lastTree : null,
         lastCommit: typeof parsed.lastCommit === "string" ? parsed.lastCommit : null,
+        ...(typeof parsed.lastIndexHash === "string" ? { lastIndexHash: parsed.lastIndexHash } : {}),
+        ...(typeof parsed.lastFileCount === "number" ? { lastFileCount: parsed.lastFileCount } : {}),
+        ...(parsed.forcedResident === true ? { forcedResident: true } : {}),
+        ...(typeof parsed.nestedCleanAt === "number" ? { nestedCleanAt: parsed.nestedCleanAt } : {}),
+        ...(parsed.indexDiverged === true ? { indexDiverged: true } : {}),
         caseInsensitive: parsed.caseInsensitive === true,
         symlinks: typeof parsed.symlinks === "boolean" ? parsed.symlinks : process.platform !== "win32",
         unsupported: parsed.unsupported ?? null,
@@ -480,6 +521,16 @@ export class Shadow {
     }
   }
 
+  private async indexHash(signal = this.requestSignal): Promise<string | null> {
+    try {
+      const bytes = await readFile(path.join(this.gitDir, "index"), { signal });
+      return createHash("sha256").update(bytes).digest("hex");
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+      throw error;
+    }
+  }
+
   /** Also leave alone these directories when inside the workspace (bb thread storage). */
   skipPaths(absolute: readonly string[]): this {
     const root = path.resolve(this.workspace);
@@ -532,6 +583,11 @@ export class Shadow {
       if (!this.skipDirs.includes(internal)) this.skipDirs.push(internal);
     }
     if (fresh.length > 0) {
+      // Persist invalidation with the new policy, even if this call ends
+      // before capture can remove the newly excluded entries.
+      delete state.lastFileCount;
+      delete state.forcedResident;
+      delete state.nestedCleanAt;
       state.skipPaths = [...state.skipPaths, ...fresh].slice(-MAX_SKIP_PATHS);
       await this.saveState();
     }
@@ -565,6 +621,11 @@ export class Shadow {
     const current = await readFile(file, "utf8").catch(() => null);
     signal?.throwIfAborted();
     if (current === content) return false;
+    // Remember that policy still needs reconciliation before writing it.
+    // If capture is interrupted, the next call sees identical exclude text
+    // but must still drop files the new rules exclude from the old index.
+    delete this.state!.forcedMembershipHash;
+    await this.saveState();
     await writeFile(file, content);
     signal?.throwIfAborted();
     return true;
@@ -633,8 +694,10 @@ export class Shadow {
     signal?.throwIfAborted();
     const excludesChanged = await this.syncExcludes(layout, signal);
     const firstCapture = state.lastTree === null;
+    const phases: CapturePhases = { statusMs: 0, indexCheckMs: 0, indexListMs: 0, nestedProbeMs: 0, updateIndexMs: 0, writeTreeMs: 0, unchangedFastPath: false };
 
     let statusOutput: Buffer;
+    const statusStarted = performance.now();
     try {
       statusOutput = (
         await this.git(["status", "--porcelain=v2", "-z", "--untracked-files=all", "--no-renames", "--ignore-submodules=all"], {
@@ -649,6 +712,7 @@ export class Shadow {
       }
       throw error;
     }
+    phases.statusMs = phaseMs(statusStarted);
 
     const toUpdate = new Map<string, boolean>(); // path → tracked in the shadow index
     const skipped: SkippedFile[] = [];
@@ -669,11 +733,42 @@ export class Shadow {
     }
 
     // Files the user's repository tracks despite matching an ignore rule.
+    // Status hides them, so a later appearance has to be caught by a full scan.
     const forced = await trackedButIgnored(this.workspace, layout, this.now(), signal);
     signal?.throwIfAborted();
     const forcedSet = new Set(forced);
+    const forcedMembershipHash = createHash("sha256").update(nulInput(forced)).digest("hex");
+    let rulesChanged = excludesChanged || forcedMembershipHash !== state.forcedMembershipHash || touchesGitignore(toUpdate.keys());
+    const capLowered = !firstCapture && (state.maxFileBytes === undefined || limits.maxFileBytes < state.maxFileBytes);
+    const now = this.now();
+    const nestedFresh = typeof state.nestedCleanAt === "number" && now >= state.nestedCleanAt && now - state.nestedCleanAt < NESTED_RECHECK_MS;
+    const indexCheckStarted = performance.now();
+    const indexHash = await this.indexHash(signal);
+    phases.indexCheckMs = phaseMs(indexCheckStarted);
+    const indexMatchesSavedTree = state.indexDiverged !== true && indexHash !== null && indexHash === state.lastIndexHash;
+    // Nothing in status, and the last full capture already proved the index.
+    // Skip the index list, the nested walk, and write-tree. A fresh nested
+    // repository with no status row is rechecked once the mark expires.
+    if (
+      state.lastTree !== null &&
+      state.lastFileCount !== undefined &&
+      state.lastFileCount <= limits.maxFiles &&
+      state.forcedResident === true &&
+      toUpdate.size === 0 &&
+      skipped.length === 0 &&
+      !rulesChanged &&
+      !capLowered &&
+      indexMatchesSavedTree &&
+      nestedFresh
+    ) {
+      phases.unchangedFastPath = true;
+      return { status: "ok", tree: state.lastTree, skipped, fileCount: state.lastFileCount, layout, phases };
+    }
+
     // One index walk, shared by forced membership, skip directories, nested boundaries and policy revalidation.
+    const indexStarted = performance.now();
     const indexedPaths = splitNul((await this.git(["ls-files", "-z", "--cached"])).stdout).map(toInternal);
+    phases.indexListMs = phaseMs(indexStarted);
     const indexed = new Set(indexedPaths);
     if (forced.length > 0) {
       for (const candidate of forced) {
@@ -684,12 +779,11 @@ export class Shadow {
         }
       }
     }
+    if (!rulesChanged && touchesGitignore(toUpdate.keys())) rulesChanged = true;
 
     // git never untracks a file because it became ignored, but the user's
     // repository does not track it either: when the rules change, drop newly
     // ignored files from the shadow so they are neither captured nor touched.
-    const forcedMembershipHash = createHash("sha256").update(nulInput(forced)).digest("hex");
-    const rulesChanged = excludesChanged || forcedMembershipHash !== state.forcedMembershipHash || [...toUpdate.keys()].some((candidate) => candidate === ".gitignore" || candidate.endsWith("/.gitignore"));
     const toUntrack = new Set<string>();
     if (rulesChanged && !firstCapture) {
       const ignoredTracked = splitNul((await this.git(["ls-files", "-z", "--cached", "--ignored", "--exclude-standard"])).stdout).map(toInternal);
@@ -701,6 +795,7 @@ export class Shadow {
     }
 
     const toRemove = new Set<string>();
+    const nestedStarted = performance.now();
     const nested = nestedRepositoryProbe(this.workspace, signal);
     for (const candidate of new Set([...indexedPaths, ...toUpdate.keys()])) {
       if (await nested(candidate)) {
@@ -708,6 +803,7 @@ export class Shadow {
         skipped.push({ path: candidate, reason: "nested-repository", sizeBytes: null });
       }
     }
+    phases.nestedProbeMs = phaseMs(nestedStarted);
     // Entries an earlier version captured in directories now left alone.
     for (const entry of indexedPaths) {
       signal?.throwIfAborted();
@@ -715,7 +811,7 @@ export class Shadow {
       toRemove.add(entry);
       toUpdate.delete(entry);
     }
-    if (!firstCapture && (state.maxFileBytes === undefined || limits.maxFileBytes < state.maxFileBytes)) {
+    if (capLowered) {
       const sizes = await mapLimit(indexedPaths, STAT_CONCURRENCY, candidate => this.fileKind(candidate, signal), signal);
       indexedPaths.forEach((candidate, index) => {
         signal?.throwIfAborted();
@@ -726,6 +822,7 @@ export class Shadow {
         }
       });
     }
+    const absent = new Set<string>();
     let newBytes = 0;
     const candidates = [...toUpdate.entries()];
     const kinds = await mapLimit(candidates, STAT_CONCURRENCY, async ([candidate]) => {
@@ -735,7 +832,10 @@ export class Shadow {
     candidates.forEach(([candidate, tracked], index) => {
       signal?.throwIfAborted();
       const info = kinds[index] ?? null;
-      if (info === null) return; // deleted: update-index --remove handles it
+      if (info === null) {
+        absent.add(candidate); // deleted: update-index --remove handles it
+        return;
+      }
       if (info.kind === "dir" || info.kind === "other") {
         // A captured file that became a directory (or a socket, fifo…) leaves
         // the checkpoint; the directory's own files come in as new entries.
@@ -762,11 +862,10 @@ export class Shadow {
       newBytes += info.size;
     });
 
-    const indexCount = await this.indexCount();
     let untrackedNew = 0;
     for (const tracked of toUpdate.values()) if (!tracked) untrackedNew += 1;
-    if (indexCount + untrackedNew > limits.maxFiles) {
-      return { status: "unsupported", reason: `more than ${limits.maxFiles} files to track`, fileCount: indexCount + untrackedNew, totalBytes: null };
+    if (indexedPaths.length + untrackedNew > limits.maxFiles) {
+      return { status: "unsupported", reason: `more than ${limits.maxFiles} files to track`, fileCount: indexedPaths.length + untrackedNew, totalBytes: null };
     }
     // Checked on every capture, not only the first: a later download of many
     // mid-sized files must not be hashed wholesale either.
@@ -774,21 +873,51 @@ export class Shadow {
       return {
         status: "unsupported",
         reason: `more than ${sizeLabel(limits.maxTotalBytes)} of new or changed files to capture`,
-        fileCount: indexCount + untrackedNew,
+        fileCount: indexedPaths.length + untrackedNew,
         totalBytes: newBytes,
       };
     }
 
     for (const candidate of toUntrack) toRemove.add(candidate);
+    const mutated = toRemove.size > 0 || toUpdate.size > 0;
+    // Persist this before the index changes. A dry run, a crash, or a failed
+    // restore must not let the next capture reuse a tree the index no longer matches.
+    if (mutated || !indexMatchesSavedTree) {
+      state.indexDiverged = true;
+      delete state.lastFileCount;
+      delete state.forcedResident;
+      delete state.nestedCleanAt;
+      await this.saveState();
+    }
+    const updateStarted = performance.now();
     if (toRemove.size > 0) {
       await this.git(["update-index", "--force-remove", "-z", "--stdin"], { input: nulInput(toRemove) });
     }
     if (toUpdate.size > 0) await this.updateIndex([...toUpdate.keys()], skipped, signal);
+    phases.updateIndexMs = mutated ? phaseMs(updateStarted) : 0;
 
-    const tree = (await this.git(["write-tree"])).stdout.toString("utf8").trim();
+    let tree: string;
+    if (!mutated && state.lastTree !== null && indexMatchesSavedTree) {
+      tree = state.lastTree;
+    } else {
+      const writeStarted = performance.now();
+      tree = (await this.git(["write-tree"])).stdout.toString("utf8").trim();
+      phases.writeTreeMs = phaseMs(writeStarted);
+    }
+    const savedIndexStarted = performance.now();
+    const savedIndexHash = !mutated && indexMatchesSavedTree ? indexHash : await this.indexHash(signal);
+    phases.indexCheckMs += phaseMs(savedIndexStarted);
+    if (savedIndexHash === null) delete state.lastIndexHash;
+    else state.lastIndexHash = savedIndexHash;
     state.maxFileBytes = limits.maxFileBytes;
     state.forcedMembershipHash = forcedMembershipHash;
-    return { status: "ok", tree, skipped, fileCount: await this.indexCount(), layout };
+    // The walk just ran, including when it removed nested paths. The fast path
+    // does not refresh this, so a busy thread rechecks after NESTED_RECHECK_MS.
+    state.nestedCleanAt = this.now();
+    state.lastFileCount = mutated ? await this.indexCount() : indexedPaths.length;
+    const forcedUnreadable = skipped.some((entry) => entry.reason === "unreadable" && forcedSet.has(entry.path));
+    state.forcedResident = !forcedUnreadable && forced.every((candidate) => this.skipped(candidate) || (!toRemove.has(candidate) && !absent.has(candidate) && (indexed.has(candidate) || toUpdate.has(candidate))));
+    return { status: "ok", tree, skipped, fileCount: state.lastFileCount, layout, phases };
   }
 
   /** update-index the paths, dropping (and reporting) any git cannot read. */
@@ -923,6 +1052,7 @@ export class Shadow {
     state.lastTree = captured.tree;
     state.lastCommit = commit;
     state.lastSnapshotAt = this.now();
+    delete state.indexDiverged;
     await this.saveState();
     return {
       status: "ok",
@@ -938,6 +1068,7 @@ export class Shadow {
       head,
       fileCount: captured.fileCount,
       durationMs: 0,
+      phases: captured.phases,
     };
   }
 
@@ -1239,6 +1370,13 @@ export class Shadow {
     try {
       if (effectiveTree !== currentTree) {
         applied = true;
+        // read-tree updates the index before it finishes checkout. A failure
+        // leaves that index in place, so the saved tree must not be reused.
+        state.indexDiverged = true;
+        delete state.lastFileCount;
+        delete state.forcedResident;
+        delete state.nestedCleanAt;
+        await this.saveState();
         await this.applyTree(currentTree, effectiveTree, input.limits);
       }
       const deleted = plan.apply.filter((entry) => entry.action === "delete").map((entry) => entry.path);
@@ -1249,12 +1387,20 @@ export class Shadow {
       await this.setRefs([], resultCommit);
       state.lastTree = effectiveTree;
       state.lastCommit = resultCommit;
+      if (applied) {
+        // The index matches effectiveTree now. File count and forced-file
+        // membership still describe the pre-restore capture, so the next snapshot rescans.
+        delete state.indexDiverged;
+        delete state.lastFileCount;
+        delete state.forcedResident;
+        delete state.nestedCleanAt;
+      }
       await this.saveState();
       return { ...base, applied: true, preRestore, verification, applyError: null, durationMs: this.now() - started };
     } catch (error) {
-      // The state still describes the pre-restore checkpoint: a failed
-      // read-tree leaves the shadow index as it was, and the next capture
-      // picks up whatever files did change from the workspace itself.
+      // The saved tree still describes the pre-restore checkpoint. The dirty
+      // index marker forces the next capture to rebuild whatever a partial
+      // read-tree left behind before comparing it with that checkpoint.
       return {
         ...base,
         applied,

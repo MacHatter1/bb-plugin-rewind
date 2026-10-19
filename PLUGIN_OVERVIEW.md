@@ -30,8 +30,9 @@ checkpoint; a slow one is queued until it is saved.
 
 Snapshots go into a separate git repository Rewind keeps per workspace on
 the machine that holds it, so your repository is untouched and non-git
-workspaces work too. Only changed files are re-read, and a daily cleanup
-keeps the newest checkpoints per thread.
+workspaces work too. Only changed files are re-read. Checkpoints past the
+per-thread cap are removed as new ones are saved, and a daily cleanup
+compacts what remains.
 
 ## Requirements
 
