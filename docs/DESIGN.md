@@ -416,10 +416,33 @@ The fork runs as a background job with a status the UI polls
   threads' checkpoints expire after `retentionDays` (default 14); failed
   attempts expire after a week. Retention also deletes refs the database no
   longer knows (older than an hour, so in-flight snapshots are safe), runs
-  `git gc --prune=2.hours.ago` outside the lock, and removes shadows of
+  `git gc --prune=2.hours.ago` with level-9 pack compression,
+  a 250-object delta window, two threads, and 256 MiB of delta-window memory
+  per thread outside the lock, and removes shadows of
   workspaces that no longer have an environment or any checkpoint.
+  Existing packed data and deltas are reused; daily cleanup does not force
+  unchanged stores through expensive full aggressive recompression.
 - `bb rewind prune [--dry-run]` runs it now; `--thread <id> --yes` deletes
   one thread's checkpoints.
+- `bb rewind compact [--dry-run] [--quick] [--thread <id>]` compresses stores
+  independently of retention. Without `--thread` it discovers shadows on every
+  connected host, including ones whose workspace has vanished. It never deletes
+  refs or expires objects. With `--thread`, saved checkpoint addresses select
+  the stores, so a removed environment does not block storage maintenance.
+  `git repack -a -d --keep-unreachable` keeps both
+  packed and loose unreachable objects, including concurrent snapshot writes;
+  only redundant copies are removed after packing. Aggressive recompression
+  is the default (`--deep` selects it explicitly): level 9, `-F --window=250`,
+  two threads, and a 256 MiB delta-window limit per thread. `--quick` uses a
+  10-object window with 64 MiB per thread and skips stores with one pack and
+  no loose objects. Both keep the default maximum delta depth of 50.
+  Compression does not change
+  loose-object settings on the capture path. A per-shadow maintenance mutex
+  serializes compaction, daily GC, and store removal, without holding the
+  workspace mutex during repacking. Size reports sum file lengths, bounded
+  at 500,000 entries per store; concurrent activity and filesystem allocation
+  can differ. Unavailable measurements and store/host errors are reported, and
+  partial failures return a nonzero CLI exit code.
 
 ## Bounded cost
 
@@ -434,7 +457,7 @@ The fork runs as a background job with a status the UI polls
 | Patches | 256 KiB per file, 2 MiB per call |
 | CLI output | 85% of `PLUGIN_CLI_OUTPUT_MAX_BYTES`, truncated with a note (JSON errors out instead) |
 | Agent tool output | 16 KiB |
-| Host calls | snapshot 5 min, restore 20 min (each git step 10 min), diff 2 min, gc 20 min |
+| Host calls | snapshot 5 min, restore 20 min (each git step 10 min), diff 2 min, compaction/gc 60 min |
 | Gate samples and queued-message records | last 1,000 each |
 | Command scan per checkpoint | 30 pages of 100; raw page metadata retained during local type filtering; 20 effects kept |
 | Timeline read for message numbers / fork boundary | 30 pages of 100 segments |
@@ -587,3 +610,43 @@ threads whose snapshots take 0.6–1 s):
   and cannot be used with `--path`.
 - After a message edit, the panel keeps the replaced turns' checkpoints, so
   its turn numbers can run ahead of the conversation's message numbers.
+
+## Shared object pool
+
+`bb rewind pool` is opt-in: existing and newly captured workspaces remain
+self-contained until selected for migration. A host owns `object-pool/git`
+and `object-pool/members/<shadow-key>.json`. Each journal moves through
+`copying`, `linked`, and `ready`; incomplete journals stop pool collection.
+Objects are copied durably into the pool before any alternates link or local
+cleanup. Migration preserves every original object, including unreachable
+ones. Full pool integrity and original object inventories are verified before
+duplicates are removed. Participant indexes and checkpoint refs stay in place.
+
+Every host Git operation takes a shared reader lease; migration and pool GC
+take the exclusive lease, drain active operations, and block new ones. The SDK
+provides a single host worker per plugin data directory. A durable
+`pool-maintenance.lock` also prevents a replacement worker from racing orphaned
+Git processes after a hard crash. Ordinary errors/cancellation drain subprocess
+and copy I/O before releasing the lease/lock. Never infer crash-lock ownership
+from its age. Confirm the old worker and all orphaned Git processes are stopped
+before clearing it. Rerun migration to finish its journaled work.
+
+Participant repacks use `--local`; per-store GC never prunes a shared pool.
+Daily retention calls the pool coordinator once per host after local ref
+reconciliation and store removal. The coordinator verifies all member journals
+and discovers all shadow alternates to detect unregistered borrowers. Read
+errors, invalid state, missing links, and incomplete migrations fail closed.
+GC copies new local objects into the pool, then atomically replaces its root
+inventory. Roots include all participant refs (checkpoints/Undo, imports,
+comparisons), the persistent index, detached HEAD, last tree and last commit.
+Removed/changed roots are pinned in a retired namespace for at least two hours;
+Git cruft GC also uses a two-hour prune grace period. This requires Git 2.37+.
+
+The pool is independent of user Git repositories and cannot have alternates of
+its own. Member links must point to exactly this Rewind-owned host-local pool.
+The entire pool is checked with full `git fsck` before/after packing or GC;
+participant ref closures are checked after local cleanup. Avoid full pool-byte
+scans per member, which would multiply large-media reads by the store count.
+Pool storage is counted once per host in migration/GC measurements. Backups
+must include both the pool and its members. Maintenance pauses Rewind operations
+on that machine, so large migrations/GC should run during quiet periods.

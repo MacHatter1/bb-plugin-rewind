@@ -70,11 +70,35 @@ preview lists it: tell the user those effects stay.
 | `bb rewind checkpoint [--label "…"]` | Checkpoint now. |
 | `bb rewind fork <checkpoint> [--prompt "…" \| --prompt-file f] [--title "…"]` | New thread in a new worktree, conversation cut at that point, files as they were. |
 | `bb rewind status` | Settings, message-gate latency, and this thread's state. |
+| `bb rewind compact [--dry-run] [--quick] [--thread <id>]` | Aggressively recompress storage on connected machines without deleting checkpoints. `--thread` selects stores holding that thread's checkpoints, including vanished workspaces; `--quick` only packs loose objects and combines packs. |
+| `bb rewind pool [--dry-run] [--thread <id>]` | Opt in to shared-object storage. Copy and verify before linking stores and removing local duplicates; rerun to resume an interrupted migration or add new stores. |
+| `bb rewind pool --gc [--dry-run]` | Coordinate collection across every pool member; cannot be limited to one thread. Also runs during daily retention. |
 | `bb rewind prune [--dry-run]` | Apply retention now. Checkpoints past the per-thread cap are also removed as new ones are saved. `--thread <id> --yes` deletes one thread's checkpoints. |
 
-Thread-scoped commands default to the calling thread; outside a thread pass
+Thread-scoped commands default to the calling thread; `compact` defaults to
+all stores. Outside a thread pass
 `--thread <thread-id>`. Every command accepts `--json`. Checkpoint ids can be
 shortened to any unique prefix.
+
+For storage pressure, preview with `bb rewind compact --dry-run`, then use
+`bb rewind compact` to aggressively recompress existing packs while preserving
+all checkpoints and unreferenced objects. `--deep` explicitly selects this
+default; `--quick` skips aggressive recompression. Temporary space is needed
+for replacement packs, and compressed
+media may shrink very little. `prune` also applies retention and can delete
+history; compaction does not.
+
+`pool --dry-run` measures without writes. Pool migration preserves checkpoint
+refs and all stored objects, including unreachable objects; new snapshots keep
+writing locally. Shared-pool migration/GC pause Rewind operations on that host,
+so run them when other threads can wait. GC inventories every member and pins
+Undo, imports, comparisons, indexes and cached roots as well as checkpoints.
+It retains retired roots for two hours and refuses incomplete migrations or
+uncertain membership. Never run ordinary Git GC/prune on `object-pool/git`,
+delete the pool, or move a member without its Rewind-owned pool. Keep both in
+backups. A crash lock must not be cleared until its worker and any orphaned Git
+processes are confirmed stopped; age alone is not evidence. A handled failure
+needs only a rerun of `pool`.
 
 ## Safety behaviour to rely on
 

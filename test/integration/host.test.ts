@@ -14,7 +14,7 @@ import hostEntry from "../../host";
 import { newId } from "../../src/ids";
 import { resetGitBaseEnv } from "../../src/host/git";
 import { activeLockCount } from "../../src/host/lock";
-import { shadowKey } from "../../src/host/shadow";
+import { Shadow, shadowKey } from "../../src/host/shadow";
 import { clearUserRepoCaches } from "../../src/host/user-repo";
 import type { SnapshotLimits } from "../../src/host-contract";
 import {
@@ -1524,6 +1524,88 @@ describe("limits and store management", () => {
     expect(treeToObject(await snapshotTree(fork, { skip: (relative) => relative === ".env" }))).toEqual(treeToObject(expected));
     expect(await readFile(path.join(fork, ".env"), "utf8")).toBe("copied by .worktreeinclude\n");
     expect(await readFile(path.join(source, "a.txt"), "utf8")).toBe("later work\n");
+  });
+
+  it.each([false, true])("compacts storage without losing checkpoint or unreachable objects (deep=%s)", async deep => {
+    const ws = await tempDir("ws");
+    await initRepo(ws, { "a.txt": "first\n", ".gitignore": ".env\n" });
+    await write(ws, ".env", "ignored\n");
+    const first = await okSnap(ws);
+    const gitDir = path.join(dataDir, "shadows", shadowKey(ws), "git");
+    const addUnreferenced = (content: string) => execFileSync("git", [`--git-dir=${gitDir}`, "hash-object", "-w", "--stdin"], { input: content, encoding: "utf8", timeout: GIT_TIMEOUT_MS }).trim();
+    const packedOrphan = addUnreferenced("unreferenced packed data\n");
+    shadowGit(ws, "repack", "-a", "-d", "--keep-unreachable");
+    const shared = Array.from({ length: 1_000 }, (_, index) => `function f${index}() { return ${index * index + 17}; }\n`).join("");
+    for (let index = 0; index < 40; index += 1) await write(ws, `src/${index}.txt`, `version ${index}\n${shared}`);
+    await write(ws, "a.txt", "second\n");
+    await okSnap(ws);
+    const looseOrphan = addUnreferenced("snapshot data not yet referenced\n");
+    const refs = shadowGit(ws, "for-each-ref", "--format=%(refname) %(objectname)");
+    const objects = () => shadowGit(ws, "cat-file", "--batch-all-objects", "--batch-check=%(objectname)").trim().split("\n").sort();
+    const beforeObjects = objects();
+    const beforeWorkspace = treeToObject(await snapshotTree(ws));
+    const beforeGit = await fingerprint(path.join(ws, ".git"));
+    const result = await harness.experimental_call("compact", { workspace: ws, dryRun: false, deep });
+    expect(result).toMatchObject({ needed: true, compacted: true });
+    expect(result.afterBytes!).toBeLessThan(result.beforeBytes!);
+    expect(shadowGit(ws, "for-each-ref", "--format=%(refname) %(objectname)")).toBe(refs);
+    expect(objects()).toEqual(beforeObjects);
+    expect(shadowGit(ws, "cat-file", "-p", packedOrphan)).toBe("unreferenced packed data\n");
+    expect(shadowGit(ws, "cat-file", "-p", looseOrphan)).toBe("snapshot data not yet referenced\n");
+    shadowGit(ws, "fsck", "--full", "--no-dangling");
+    expect(treeToObject(await snapshotTree(ws))).toEqual(beforeWorkspace);
+    expect(await fingerprint(path.join(ws, ".git"))).toBe(beforeGit);
+    if (!deep) expect((await harness.experimental_call("compact", { workspace: ws, dryRun: false, deep })).compacted).toBe(false);
+    const restored = await restore(ws, first);
+    expect(restored.verification?.ok).toBe(true);
+    expect(await readFile(path.join(ws, "a.txt"), "utf8")).toBe("first\n");
+    expect(await readFile(path.join(ws, ".env"), "utf8")).toBe("ignored\n");
+  });
+
+  it("previews compaction without writing and can compact after the workspace vanishes", async () => {
+    const ws = await tempDir("ws"); await write(ws, "a.txt", "saved\n");
+    const saved = await okSnap(ws);
+    const root = path.join(dataDir, "shadows", shadowKey(ws));
+    const before = await fingerprint(root);
+    expect(await harness.experimental_call("compact", { workspace: ws, dryRun: true, deep: false })).toMatchObject({ needed: true, compacted: false });
+    expect(await fingerprint(root)).toBe(before);
+    await rm(ws, { recursive: true, force: true });
+    expect((await harness.experimental_call("compact", { workspace: ws, dryRun: false, deep: false })).compacted).toBe(true);
+    expect(shadowGit(ws, "show", `${saved.commit}:a.txt`)).toBe("saved\n");
+  });
+
+  it("keeps snapshots responsive while serializing compaction with daily GC", async () => {
+    const ws = await tempDir("ws"); await write(ws, "a.txt", "saved\n");
+    await okSnap(ws);
+    let entered!: () => void, release!: () => void, queued!: () => void;
+    const packing = new Promise<void>(resolve => { entered = resolve; });
+    const barrier = new Promise<void>(resolve => { release = resolve; });
+    const gcQueued = new Promise<void>(resolve => { queued = resolve; });
+    const bare = Shadow.prototype.bare, gc = Shadow.prototype.gc;
+    let gcStarted = false;
+    const bareSpy = vi.spyOn(Shadow.prototype, "bare").mockImplementation(async function (this: Shadow, args, options) {
+      if (args.includes("repack")) { entered(); await barrier; }
+      if (args.includes("gc")) gcStarted = true;
+      return bare.call(this, args, options);
+    });
+    const gcSpy = vi.spyOn(Shadow.prototype, "gc").mockImplementation(function (this: Shadow) { queued(); return gc.call(this); });
+    const compact = harness.experimental_call("compact", { workspace: ws, dryRun: false, deep: false });
+    let cleanup: Promise<unknown> | undefined;
+    try {
+      await packing;
+      await write(ws, "a.txt", "concurrent\n");
+      const saved = await okSnap(ws);
+      cleanup = harness.experimental_call("reconcile", { workspace: ws, keepCheckpointIds: [saved.checkpointId], minAgeMs: 60 * 60 * 1000, gc: true });
+      await gcQueued;
+      expect(gcStarted).toBe(false);
+      release();
+      await compact; await cleanup;
+      expect(gcStarted).toBe(true);
+      expect(shadowGit(ws, "show", `${saved.commit}:a.txt`)).toBe("concurrent\n");
+    } finally {
+      release(); await Promise.allSettled([compact, ...(cleanup === undefined ? [] : [cleanup])]);
+      bareSpy.mockRestore(); gcSpy.mockRestore();
+    }
   });
 
   it("deletes checkpoint refs and reconciles unknown ones", async () => {

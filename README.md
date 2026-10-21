@@ -240,6 +240,8 @@ bb rewind undo --yes                        # changed your mind
 | `checkpoint [--label "…"]` | Take a checkpoint now. |
 | `fork <checkpoint> [--prompt "…" \| --prompt-file f] [--title "…"] [--no-wait]` | Fork with files. |
 | `status` | Settings, message-gate latency, and the thread's state. |
+| `compact [--dry-run] [--quick] [--thread <id>]` | Aggressively compress checkpoint storage while preserving all checkpoints. Defaults to all stores. |
+| `pool [--dry-run] [--thread <id>] [--gc]` | Deduplicate stores using a Rewind-owned pool; coordinate shared-object collection with `--gc`. |
 | `prune [--dry-run]` | Apply retention now; `--thread <id> --yes` deletes one thread's checkpoints. |
 
 </details>
@@ -247,6 +249,68 @@ bb rewind undo --yes                        # changed your mind
 **Agent tools:** `rewind_checkpoint({ label })` and `rewind_list({ limit })`.
 The bundled [skill](skills/rewind/SKILL.md) teaches agents to checkpoint
 before risky operations and to hand restores to you.
+
+## Compressing storage
+
+```sh
+bb rewind compact --dry-run       # measure stores without changing them
+bb rewind compact                 # aggressively recompress all checkpoint stores
+bb rewind compact --quick         # faster: pack loose objects and combine packs
+```
+
+Compaction runs on every connected machine, including stores whose original
+workspace has gone. Pass `--thread <id>` to limit it to the stores holding that
+thread's checkpoints, even if its original environment has been removed.
+It preserves checkpoint refs and all stored objects, including unreferenced
+objects, and reports the storage measured before and after. It shares a queue
+with daily garbage collection while snapshots continue normally.
+
+Compaction uses maximum pack compression and compares up to 250 similar
+objects for smaller deltas, recompressing existing packs too. Large stores can
+take tens of minutes and need temporary space for replacement packs. `--quick`
+skips stores that already have a single pack and no loose objects. `--deep`
+explicitly selects the default aggressive mode. Daily cleanup uses the stronger
+settings for new data while reusing existing packed data. Already-compressed
+images, video, audio, and archives may shrink very little. Pack compression runs separately from
+checkpoint capture, so capturing does not use the slower compression.
+
+Measured alternatives, including shared object pools and chunked storage,
+are compared in [the storage research](docs/COMPACTION-RESEARCH.md).
+
+### Sharing identical objects across workspaces
+
+```sh
+bb rewind pool --dry-run          # measure stores; write nothing
+bb rewind pool                   # migrate stores on connected machines
+bb rewind pool --thread thr_…     # migrate only this thread's saved stores
+bb rewind pool --gc --dry-run     # preview coordinated pool collection
+bb rewind pool --gc               # collect after inventorying every member
+```
+
+Pooling is opt-in. Migration copies and verifies all objects, including
+unreferenced ones, before linking each store and removing duplicate local
+copies. Workspaces keep their own refs and indexes; snapshots write new objects
+locally. Re-running `pool` also imports new stores and new local objects. Sizes
+include the shared pool once per machine. Your repository's `.git` is untouched.
+
+Daily retention runs coordinated pool GC after reconciling workspace refs.
+It inventories every member, including vanished workspaces, and pins checkpoint,
+Undo, import, comparison, index, and cached-state roots. Retired roots remain
+pinned for at least two hours, and Git also uses a two-hour prune grace period.
+Missing or inconsistent member information stops collection. Per-store
+`compact` and cleanup use local repacking so borrowed objects stay shared.
+
+Pool migration and GC pause Rewind operations on that machine while they run;
+large pools can take minutes and need temporary disk space. Schedule them when
+other threads can wait. The pool requires Git with cruft-pack support (2.37+)
+for GC. Interrupted migrations resume by rerunning `pool`. A hard worker crash
+leaves `pool-maintenance.lock` to stop a replacement worker from racing orphaned
+Git processes; inspect that lock and confirm all old worker/Git processes have
+stopped before clearing it and resuming migration. Do not clear it based on age.
+
+Keep `object-pool/` together with `shadows/` when backing up Rewind's host data.
+Member repositories depend on that pool. Never delete it or run standalone
+pruning against it: only Rewind's coordinated GC knows all dependent roots.
 
 ## Settings
 

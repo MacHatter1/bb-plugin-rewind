@@ -2239,6 +2239,91 @@ export class RewindService {
 
   // ---------------------------------------------------------- retention
 
+  /** Compress every shadow store, including stores of vanished workspaces. */
+  async compact(options: { dryRun: boolean; deep: boolean; threadId?: string }): Promise<{
+    stores: number;
+    needed: number;
+    compacted: number;
+    beforeBytes: number;
+    afterBytes: number;
+    unmeasured: number;
+    errors: string[];
+  }> {
+    const result = { stores: 0, needed: 0, compacted: 0, beforeBytes: 0, afterBytes: 0, unmeasured: 0, errors: [] as string[] };
+    const workspaces: Array<{ hostId: string; workspace: string }> = [];
+    if (options.threadId !== undefined) {
+      const saved = this.store.listCheckpoints(options.threadId);
+      if (saved.length > 0) {
+        const stores = new Map(saved.map(row => [JSON.stringify([row.hostId, row.workspace]), { hostId: row.hostId, workspace: row.workspace }]));
+        workspaces.push(...stores.values());
+      } else {
+        const { workspace } = await this.resolveWorkspace(options.threadId);
+        workspaces.push({ hostId: workspace.hostId, workspace: workspace.path });
+      }
+    } else {
+      for (const host of await this.sdk.hosts.list()) {
+        try {
+          const { shadows } = await this.deps.host.call("listShadows", {}, { hostId: host.id, timeoutMs: 60_000 });
+          for (const shadow of shadows) {
+            if (shadow.workspace.length > 0) workspaces.push({ hostId: host.id, workspace: shadow.workspace });
+            else result.errors.push(`${host.id}/${shadow.key}: workspace metadata is unavailable`);
+          }
+        } catch (error) {
+          result.errors.push(`${host.id}: ${errorText(error)}`);
+        }
+      }
+    }
+    for (const { hostId, workspace } of workspaces) {
+      if (this.disposed) throw new RewindError("disposed", "Rewind was stopped during compaction. Run compact again to continue.");
+      try {
+        const packed = await this.deps.host.call("compact", { workspace, dryRun: options.dryRun, deep: options.deep }, { hostId, timeoutMs: GC_TIMEOUT_MS });
+        result.stores += 1;
+        result.needed += Number(packed.needed);
+        result.compacted += Number(packed.compacted);
+        if (packed.beforeBytes === null || packed.afterBytes === null) result.unmeasured += 1;
+        else {
+          result.beforeBytes += packed.beforeBytes;
+          result.afterBytes += packed.afterBytes;
+        }
+      } catch (error) {
+        result.errors.push(`${hostId}:${workspace}: ${errorText(error)}`);
+      }
+    }
+    return result;
+  }
+
+  /** One shared-pool operation per host; pool bytes are counted once. */
+  async pool(options: { dryRun: boolean; gc: boolean; threadId?: string }): Promise<{
+    hosts: number; stores: number; migrated: number; members: number; gcHosts: number;
+    beforeBytes: number; afterBytes: number; unmeasured: number; errors: string[];
+  }> {
+    if (options.gc && options.threadId !== undefined) throw new RewindError("invalid_scope", "Shared-pool GC always inventories every member on each machine.");
+    const groups = new Map<string, string[] | null>();
+    if (options.threadId !== undefined) {
+      const rows = this.store.listCheckpoints(options.threadId);
+      if (rows.length > 0) {
+        for (const row of rows) groups.set(row.hostId, [...new Set([...(groups.get(row.hostId) ?? []), row.workspace])]);
+      } else {
+        const { workspace } = await this.resolveWorkspace(options.threadId);
+        groups.set(workspace.hostId, [workspace.path]);
+      }
+    } else {
+      for (const host of await this.sdk.hosts.list()) groups.set(host.id, null);
+    }
+    const result = { hosts: 0, stores: 0, migrated: 0, members: 0, gcHosts: 0, beforeBytes: 0, afterBytes: 0, unmeasured: 0, errors: [] as string[] };
+    for (const [hostId, workspaces] of groups) {
+      if (this.disposed) throw new RewindError("disposed", "Rewind stopped during shared-pool maintenance. Rerun pool migration to resume.");
+      try {
+        const host = await this.deps.host.call("pool", { workspaces, gc: options.gc, dryRun: options.dryRun }, { hostId, timeoutMs: GC_TIMEOUT_MS });
+        result.hosts++;
+        result.stores += host.stores; result.migrated += host.migrated; result.members += host.members; result.gcHosts += Number(host.gcRan);
+        if (host.beforeBytes === null || host.afterBytes === null) result.unmeasured++;
+        else { result.beforeBytes += host.beforeBytes; result.afterBytes += host.afterBytes; }
+      } catch (error) { result.errors.push(`${hostId}: ${errorText(error)}`); }
+    }
+    return result;
+  }
+
   async retention(options: { dryRun: boolean }): Promise<{
     deleted: number;
     byReason: Record<string, number>;
@@ -2329,6 +2414,13 @@ export class RewindService {
         hostsSkipped.add(hostId);
         this.deps.log.info(`shadow cleanup skipped host ${hostId}: ${errorText(error)}`);
       }
+    }
+    // Only after all ref reconciliation/removal: the host inventories its
+    // entire member registry independently, never just these server rows.
+    for (const host of await this.sdk.hosts.list()) {
+      if (hostsSkipped.has(host.id)) continue;
+      try { await this.deps.host.call("pool", { workspaces: null, gc: true, dryRun: false }, { hostId: host.id, timeoutMs: GC_TIMEOUT_MS }); }
+      catch (error) { hostsSkipped.add(host.id); this.deps.log.info(`shared-pool GC skipped host ${host.id}: ${errorText(error)}`); }
     }
     return { deleted: deleted.length, byReason, refsDeleted, shadowsRemoved, hostsSkipped: [...hostsSkipped] };
   }

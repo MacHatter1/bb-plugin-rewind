@@ -9,6 +9,8 @@ import type { HostContract, SkippedFile } from "../host-contract";
 import { runGit } from "./git";
 import { withLock, workspaceIdentity } from "./lock";
 import { directorySize, listShadowStates, Shadow, shadowsRoot } from "./shadow";
+import { ObjectPool } from "./pool";
+import { pooledRepository, withPoolRead } from "./pool-coordination";
 
 async function lockKey(shadow: Shadow): Promise<string> {
   try { return (await workspaceIdentity(shadow.workspace)).identity; }
@@ -88,7 +90,7 @@ export function createHostHandlers(dataDirOverride?: string): Handlers {
         if (stale.length > 0) await shadow.bare(["update-ref", "--stdin"], { input: stale.map(ref => `delete ${ref}\n`).join("") });
         if (comparisons.size >= 32) return { status: "unavailable", reason: "Too many active comparisons; close or refresh a comparison." };
         const id = `${Date.now()}-${randomUUID()}`;
-        const timer = setTimeout(() => { void release(id).catch(() => undefined); }, 120_000); timer.unref();
+        const timer = setTimeout(() => { void withPoolRead(dataDirOf(context), () => release(id)).catch(() => undefined); }, 120_000); timer.unref();
         // Reserve synchronously so simultaneous workspace calls cannot exceed the cap.
         comparisons.set(id, { workspace: input.workspace, signature, shadow: new Shadow(dataDirOf(context), input.workspace), key, from: result.fromTree, to: result.toTree, skipped: result.skipped, expires: Date.now() + 120_000, timer });
         try {
@@ -132,6 +134,13 @@ export function createHostHandlers(dataDirOverride?: string): Handlers {
       return withLock(await lockKey(shadow), async () => ({ deleted: await shadow.deleteCheckpoints(input.checkpointIds) }));
     },
 
+    compact: async (input, context) => shadowFor(context, input.workspace).compact(input),
+
+    pool: async (input, context) => {
+      const pool = new ObjectPool(dataDirOf(context), context.signal);
+      return input.gc ? pool.gc(input.dryRun) : pool.migrate(input.workspaces, input.dryRun);
+    },
+
     reconcile: async (input, context) => {
       const shadow = shadowFor(context, input.workspace);
       const deletedRefs = await withLock(await lockKey(shadow), () =>
@@ -162,11 +171,11 @@ export function createHostHandlers(dataDirOverride?: string): Handlers {
 
     removeShadow: async (input, context) => {
       const root = path.join(shadowsRoot(dataDirOf(context)), input.key);
-      return withLock(input.key, async () => {
+      return withLock(`rewind-maintenance:${root}`, () => withLock(input.key, async () => {
         const existed = (await listShadowStates(dataDirOf(context))).some((entry) => entry.key === input.key);
         await rm(root, { recursive: true, force: true });
         return { removed: existed };
-      });
+      }), context.signal);
     },
 
     status: async (input, context) => {
@@ -190,6 +199,22 @@ export function createHostHandlers(dataDirOverride?: string): Handlers {
       });
     },
   };
-  disposers.set(handlers, async () => { await Promise.allSettled([...comparisons.keys()].map(release)); });
-  return handlers;
+  // A single gate covers every Git reader and writer, including cross-store
+  // imports, ref deletion, comparison pins, and removal. Pool maintenance
+  // takes its exclusive side before touching any participant or shared pack.
+  const wrapped = Object.fromEntries(Object.entries(handlers).map(([method, handler]) => [method, method === "pool" ? handler :
+    (input: unknown, context: ExperimentalHostRpcContext) => withPoolRead(dataDirOf(context), async () => {
+      if (method !== "identity" && typeof input === "object" && input !== null && "workspace" in input && typeof input.workspace === "string") {
+        const shadow = shadowFor(context, input.workspace);
+        if (await shadow.exists()) await pooledRepository(dataDirOf(context), shadow.gitDir);
+      }
+      return (handler as (input: unknown, context: ExperimentalHostRpcContext) => Promise<unknown>)(input, context);
+    }, context.signal),
+  ])) as Handlers;
+  disposers.set(wrapped, async () => {
+    // Disposal has no cancelled request signal; release pins after active
+    // pool maintenance drains, without recursively entering the reader gate.
+    await Promise.allSettled([...comparisons.keys()].map(id => withPoolRead(dataDirOverride ?? comparisons.get(id)!.shadow.dataDir, () => release(id))));
+  });
+  return wrapped;
 }
