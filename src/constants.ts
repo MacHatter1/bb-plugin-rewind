@@ -53,7 +53,7 @@ export const SNAPSHOT_TIMEOUT_MS = 5 * 60 * 1000;
  */
 export const RESTORE_TIMEOUT_MS = 20 * 60 * 1000;
 export const DIFF_TIMEOUT_MS = 2 * 60 * 1000;
-export const GC_TIMEOUT_MS = 20 * 60 * 1000;
+export const GC_TIMEOUT_MS = 60 * 60 * 1000;
 
 /** Output bounds. Host results are capped at 8 MiB by the daemon. */
 export const MAX_PATCH_BYTES_PER_FILE = 256 * 1024;

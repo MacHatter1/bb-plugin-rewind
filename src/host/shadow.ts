@@ -13,6 +13,7 @@ import { performance } from "node:perf_hooks";
 import {
   BB_CHAT_DIR,
   EMPTY_TREE,
+  GC_TIMEOUT_MS,
   MAX_LISTED_SKIPPED,
   MAX_STORED_CHANGES,
   UNSUPPORTED_RECHECK_MS,
@@ -49,6 +50,8 @@ import {
 } from "./git";
 import { indexEntryCount, parseDiffTree, parseStatusV2, splitPatch, type TreeChange } from "./parse";
 import { actionFor, planRestore, type EntryKind } from "./plan";
+import { withLock } from "./lock";
+import { pooledRepository } from "./pool-coordination";
 import {
   probeLayout,
   nestedRepositoryProbe,
@@ -1500,8 +1503,53 @@ export class Shadow {
 
   /** Repack and prune objects no checkpoint references. */
   async gc(): Promise<void> {
-    if (!(await this.exists())) return;
-    await this.bare(["gc", "--quiet", "--prune=2.hours.ago"], { timeoutMs: 20 * 60_000 });
+    await withLock(this.maintenanceKey, async () => {
+      if (!(await this.exists())) return;
+      if (await pooledRepository(this.dataDir, this.gitDir)) {
+        // Pool reachability belongs to the host-wide coordinator. A local
+        // repack must never copy borrowed objects back or prune pool data.
+        await this.bare(["repack", "-a", "-d", "--local", "--keep-unreachable", "--quiet", "--threads=2"], { timeoutMs: GC_TIMEOUT_MS });
+        return;
+      }
+      await this.bare([
+        "-c", "pack.compression=9", "-c", "pack.threads=2", "-c", "pack.windowMemory=256m",
+        "-c", "pack.window=250", "-c", "pack.depth=50",
+        "gc", "--quiet", "--prune=2.hours.ago",
+      ], { timeoutMs: GC_TIMEOUT_MS });
+    }, this.requestSignal);
+  }
+
+  /** Maintenance shares a queue with GC, without holding up workspace snapshots. */
+  get maintenanceKey(): string {
+    return `rewind-maintenance:${this.root}`;
+  }
+
+  /** Pack objects without expiring refs or discarding even unreachable objects. */
+  async compact(options: { dryRun: boolean; deep: boolean }): Promise<{
+    needed: boolean;
+    compacted: boolean;
+    beforeBytes: number | null;
+    afterBytes: number | null;
+  }> {
+    return withLock(this.maintenanceKey, async () => {
+      if (!(await this.exists())) return { needed: false, compacted: false, beforeBytes: 0, afterBytes: 0 };
+      const beforeBytes = await directorySize(this.root);
+      const pooled = await pooledRepository(this.dataDir, this.gitDir);
+      const counts = new Map((await this.text(["count-objects", "-v"])).split("\n").map(line => line.split(": ") as [string, string]));
+      const needed = options.deep || Number(counts.get("count")) > 0 || Number(counts.get("packs")) > 1;
+      if (options.dryRun || !needed) return { needed, compacted: false, beforeBytes, afterBytes: beforeBytes };
+      // --keep-unreachable also keeps objects a concurrent snapshot has written
+      // but not referenced yet. -d removes only redundant copies after packing.
+      // Compression is confined to packs; capture keeps its fast loose writes.
+      await this.bare([
+        "-c", "pack.compression=9",
+        "repack", "-a", "-d", "--keep-unreachable", "--quiet",
+        ...(pooled ? ["--local"] : []),
+        "--threads=2", "--depth=50",
+        ...(options.deep ? ["-F", "--window=250", "--window-memory=256m"] : ["--window=10", "--window-memory=64m"]),
+      ], { timeoutMs: GC_TIMEOUT_MS });
+      return { needed, compacted: true, beforeBytes, afterBytes: await directorySize(this.root) };
+    }, this.requestSignal);
   }
 
   async refCount(): Promise<number | null> {

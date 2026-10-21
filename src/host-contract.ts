@@ -333,6 +333,30 @@ export const hostContract = defineRpcContract({
     input: z.object({ workspace: absolutePathSchema, checkpointIds: z.array(checkpointIdSchema).max(20_000) }).strict(),
     output: z.object({ deleted: z.number().int().min(0) }).strict(),
   },
+  compact: {
+    input: z.object({ workspace: absolutePathSchema, dryRun: z.boolean(), deep: z.boolean() }).strict(),
+    output: z.object({
+      needed: z.boolean(),
+      compacted: z.boolean(),
+      beforeBytes: z.number().int().min(0).nullable(),
+      afterBytes: z.number().int().min(0).nullable(),
+    }).strict(),
+  },
+  pool: {
+    input: z.object({
+      workspaces: z.array(absolutePathSchema).max(20_000).nullable(),
+      gc: z.boolean(),
+      dryRun: z.boolean(),
+    }).strict().refine(input => !input.gc || input.workspaces === null, "pool GC always inventories every member"),
+    output: z.object({
+      stores: z.number().int().min(0),
+      migrated: z.number().int().min(0),
+      members: z.number().int().min(0),
+      gcRan: z.boolean(),
+      beforeBytes: z.number().int().min(0).nullable(),
+      afterBytes: z.number().int().min(0).nullable(),
+    }).strict(),
+  },
   reconcile: {
     input: z
       .object({

@@ -15,7 +15,7 @@ import { shadowKey } from "../src/host/shadow";
 import { newId } from "../src/ids";
 import { RewindStore } from "../src/store";
 import type { CheckpointDto, RestoreOutcome, WorkspaceInfo } from "../src/rpc-contract";
-import { GIT_TIMEOUT_MS, exists, initRepo, removeTempDirs, tempDir, userGit, write } from "./helpers/fs";
+import { GIT_TIMEOUT_MS, exists, fingerprint, initRepo, removeTempDirs, tempDir, userGit, write } from "./helpers/fs";
 import { createWorld, queuedRow, type World } from "./helpers/world";
 
 const worlds: World[] = [];
@@ -1324,6 +1324,95 @@ describe("lifecycle events", () => {
     });
     expect((await list(world, thread.id)).checkpoints).toHaveLength(0);
     expect(world.hostCalls.some((call) => call.method === "deleteRefs")).toBe(true);
+  });
+});
+
+describe("storage compaction", () => {
+  it("previews shared pooling, migrates saved thread stores after the environment vanishes, and runs coordinated GC", async () => {
+    const { world, thread, workspace } = await setup();
+    const { checkpoint } = await world.rpc<{ checkpoint: CheckpointDto }>("checkpoint", { threadId: thread.id });
+    const otherWorkspace = await tempDir("pool-other"); await write(otherWorkspace, "b", "other");
+    const other = world.addThread({ environmentId: world.addEnvironment(otherWorkspace).id });
+    await world.rpc("checkpoint", { threadId: other.id });
+    const before = await fingerprint(path.join(world.dataDir, "shadows"));
+    const preview = await world.harness.behavior.runCli(["pool", "--dry-run", "--json"]);
+    expect(preview.exitCode).toBe(0);
+    expect(JSON.parse(preview.stdout)).toMatchObject({ stores: 2, migrated: 0, errors: [] });
+    expect(await fingerprint(path.join(world.dataDir, "shadows"))).toBe(before);
+    await fsPromises.rm(workspace, { recursive: true, force: true }); thread.environmentId = null;
+    const pooled = await world.harness.behavior.runCli(["pool", "--thread", thread.id, "--json"]);
+    expect(pooled.exitCode).toBe(0);
+    expect(JSON.parse(pooled.stdout)).toMatchObject({ hosts: 1, stores: 1, migrated: 1, members: 1, errors: [] });
+    expect((await list(world, thread.id)).checkpoints.some(row => row.id === checkpoint.id)).toBe(true);
+    const collected = await world.harness.behavior.runCli(["pool", "--gc", "--json"]);
+    expect(collected.exitCode).toBe(0);
+    expect(JSON.parse(collected.stdout)).toMatchObject({ stores: 1, members: 1, gcHosts: 1, errors: [] });
+    expect((await world.harness.behavior.runCli(["pool", "--gc", "--thread", thread.id])).exitCode).not.toBe(0);
+  });
+
+  it("reports shared-pool failures with a failing exit code and coordinates GC once after daily reconciliation", async () => {
+    const { world, thread } = await setup(); await world.rpc("checkpoint", { threadId: thread.id });
+    expect((await world.harness.behavior.runCli(["pool", "--json"])).exitCode).toBe(0);
+    const start = world.hostCalls.length;
+    await world.harness.behavior.runSchedule("retention");
+    const calls = world.hostCalls.slice(start);
+    const pooled = calls.filter(call => call.method === "pool");
+    expect(pooled).toHaveLength(1);
+    expect(pooled[0]!.input).toMatchObject({ gc: true, workspaces: null });
+    expect(calls.findIndex(call => call.method === "pool")).toBeGreaterThan(calls.findIndex(call => call.method === "reconcile"));
+    world.setBeforeHostCall(method => { if (method === "pool") throw new Error("pool unavailable"); });
+    const failed = await world.harness.behavior.runCli(["pool", "--json"]);
+    expect(failed.exitCode).toBe(1);
+    expect(JSON.parse(failed.stdout)).toMatchObject({ hosts: 0, errors: [expect.stringContaining("pool unavailable")] });
+  });
+
+  it("previews and compacts every workspace without applying retention", async () => {
+    const { world, thread, workspace } = await setup({ settings: { retentionDays: 1 } });
+    await world.rpc("checkpoint", { threadId: thread.id });
+    thread.archivedAt = Date.now() - 10 * 24 * 60 * 60 * 1000;
+    const secondWorkspace = await tempDir("second-ws"); await write(secondWorkspace, "b.txt", "second\n");
+    const second = world.addThread({ environmentId: world.addEnvironment(secondWorkspace).id });
+    await world.rpc("checkpoint", { threadId: second.id });
+    const ids = (await list(world, thread.id)).checkpoints.map(row => row.id);
+    const before = await fingerprint(path.join(world.dataDir, "shadows"));
+    const dry = await world.harness.behavior.runCli(["compact", "--dry-run", "--json"]);
+    expect(dry.exitCode).toBe(0);
+    expect(JSON.parse(dry.stdout)).toMatchObject({ stores: 2, needed: 2, compacted: 0, errors: [] });
+    expect(await fingerprint(path.join(world.dataDir, "shadows"))).toBe(before);
+    const packed = await world.harness.behavior.runCli(["compact", "--json"]);
+    expect(packed.exitCode).toBe(0);
+    expect(JSON.parse(packed.stdout)).toMatchObject({ stores: 2, compacted: 2, errors: [] });
+    expect((await list(world, thread.id)).checkpoints.map(row => row.id)).toEqual(ids);
+    expect(world.hostCalls.some(call => call.method === "reconcile" || call.method === "deleteRefs")).toBe(false);
+    expect(await readFile(path.join(workspace, "scratch.txt"), "utf8")).toBe("zero\n");
+  });
+
+  it("scopes --thread to its workspace and reports partial failures with a failing exit code", async () => {
+    const { world, thread } = await setup(); await world.rpc("checkpoint", { threadId: thread.id });
+    const secondWorkspace = await tempDir("second-ws"); await write(secondWorkspace, "b.txt", "second\n");
+    const second = world.addThread({ environmentId: world.addEnvironment(secondWorkspace).id });
+    await world.rpc("checkpoint", { threadId: second.id });
+    const scoped = await world.harness.behavior.runCli(["compact", "--thread", second.id, "--deep", "--json"]);
+    expect(scoped.exitCode).toBe(0);
+    expect(JSON.parse(scoped.stdout)).toMatchObject({ stores: 1, compacted: 1, errors: [] });
+    world.setBeforeHostCall(async (method, input) => {
+      if (method === "compact" && (input as { workspace: string }).workspace !== secondWorkspace) throw new Error("store unavailable");
+    });
+    const partial = await world.harness.behavior.runCli(["compact", "--json"]);
+    expect(partial.exitCode).toBe(1);
+    expect(JSON.parse(partial.stdout)).toMatchObject({ stores: 1, errors: [expect.stringContaining("store unavailable")] });
+  });
+
+  it("compacts a thread's saved stores after its workspace and environment have vanished", async () => {
+    const { world, thread, workspace } = await setup();
+    const { checkpoint } = await world.rpc<{ checkpoint: CheckpointDto }>("checkpoint", { threadId: thread.id });
+    await fsPromises.rm(workspace, { recursive: true, force: true });
+    thread.environmentId = null;
+    const packed = await world.harness.behavior.runCli(["compact", "--thread", thread.id, "--quick", "--json"]);
+    expect(packed.exitCode).toBe(0);
+    expect(JSON.parse(packed.stdout)).toMatchObject({ stores: 1, compacted: 1, errors: [] });
+    const gitDir = path.join(world.dataDir, "shadows", shadowKey(workspace), "git");
+    expect(execFileSync("git", [`--git-dir=${gitDir}`, "show", `${checkpoint.commit}:scratch.txt`], { encoding: "utf8", timeout: GIT_TIMEOUT_MS })).toBe("zero\n");
   });
 });
 

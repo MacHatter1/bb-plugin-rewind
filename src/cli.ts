@@ -423,6 +423,66 @@ export function buildCli(deps: CliDeps): PluginCliRegistration {
           }),
       }),
 
+      compact: cliCommand({
+        summary: "Compress checkpoint storage while preserving every checkpoint",
+        description: "Aggressively recompresses Rewind's stores on every connected machine, including existing packs. With --thread, packs the stores holding that thread's checkpoints, including vanished workspaces. --quick only packs loose objects and combines packs. Captured files and checkpoint history are preserved; large stores can take tens of minutes and need temporary space for the new packs.",
+        options: {
+          "dry-run": { type: "boolean", description: "Measure storage and report which stores need packing; write nothing" },
+          deep: { type: "boolean", description: "Aggressively recompress existing packs (the default)" },
+          quick: { type: "boolean", description: "Only pack loose objects and combine packs; skip aggressive recompression" },
+          thread: { ...threadOption, description: "Compress this thread's checkpoint stores; defaults to all stores" },
+          json: jsonOption,
+        },
+        constraints: [{ kind: "at-most-one", options: ["deep", "quick"] }],
+        run: (input, ctx) => guard(async () => {
+          const result = await service.compact({
+            dryRun: input.options["dry-run"],
+            deep: !input.options.quick,
+            ...(input.options.thread === undefined ? {} : { threadId: threadFor(input.options.thread, ctx, "compact") }),
+          });
+          if (input.options.json) return { ...json(result), exitCode: result.errors.length > 0 ? 1 : 0 };
+          const size = (bytes: number) => `${(bytes / 1024 ** 2).toFixed(1)} MiB`;
+          const lines = input.options["dry-run"]
+            ? [`Would compact ${result.needed} of ${plural(result.stores, "workspace store")} (${size(result.beforeBytes)} measured).`]
+            : [
+              `Compacted ${result.compacted} of ${plural(result.stores, "workspace store")}.`,
+              `Measured storage: ${size(result.beforeBytes)} → ${size(result.afterBytes)} (${size(Math.abs(result.beforeBytes - result.afterBytes))} ${result.beforeBytes >= result.afterBytes ? "saved" : "larger"}).`,
+            ];
+          lines.push("Every checkpoint is preserved.");
+          if (result.unmeasured > 0) lines.push(`Size unavailable for ${plural(result.unmeasured, "store")}.`);
+          if (result.errors.length > 0) lines.push(`Skipped ${plural(result.errors.length, "store or machine")}:`, ...result.errors.slice(0, 20));
+          return { ...text(lines.join("\n")), exitCode: result.errors.length > 0 ? 1 : 0 };
+        }),
+      }),
+
+      pool: cliCommand({
+        summary: "Deduplicate checkpoint stores using a Rewind-owned shared object pool",
+        description: "Copies and verifies objects before linking stores and removing duplicate local copies. Existing checkpoint refs and unreachable objects are preserved during migration. --gc inventories every member, pins all live roots, and collects expired objects with a two-hour grace period. Shared-pool maintenance pauses Rewind operations on that machine until it finishes. Interrupted migrations can be resumed by rerunning this command.",
+        options: {
+          "dry-run": { type: "boolean", description: "Measure stores without copying, linking, or collecting anything" },
+          gc: { type: "boolean", description: "Collect shared objects after inventorying every member; also runs during daily retention" },
+          thread: { ...threadOption, description: "Migrate only stores holding this thread's checkpoints; GC always uses every member" },
+          json: jsonOption,
+        },
+        constraints: [{ kind: "at-most-one", options: ["gc", "thread"] }],
+        run: (input, ctx) => guard(async () => {
+          const result = await service.pool({ dryRun: input.options["dry-run"], gc: input.options.gc,
+            ...(input.options.thread === undefined ? {} : { threadId: threadFor(input.options.thread, ctx, "pool") }),
+          });
+          if (input.options.json) return { ...json(result), exitCode: result.errors.length > 0 ? 1 : 0 };
+          const size = (bytes: number) => `${(bytes / 1024 ** 2).toFixed(1)} MiB`;
+          const lines = [input.options["dry-run"]
+            ? `Would ${input.options.gc ? "collect shared objects for" : "pool"} ${plural(result.stores, "workspace store")} on ${plural(result.hosts, "machine")}.`
+            : input.options.gc ? `Collected shared objects on ${plural(result.gcHosts, "machine")}.` : `Pooled ${plural(result.stores, "workspace store")}; ${result.migrated} newly migrated.`,
+            `Measured storage, including each shared pool once: ${size(result.beforeBytes)} → ${size(result.afterBytes)}.`,
+            `${result.members} registered pool members.`,
+          ];
+          if (result.unmeasured > 0) lines.push(`Size unavailable on ${plural(result.unmeasured, "machine")}.`);
+          if (result.errors.length > 0) lines.push("Incomplete operations (rerun migration to resume):", ...result.errors.slice(0, 20));
+          return { ...text(lines.join("\n")), exitCode: result.errors.length > 0 ? 1 : 0 };
+        }),
+      }),
+
       prune: cliCommand({
         summary: "Apply retention now, or delete one thread's checkpoints with --thread",
         description:

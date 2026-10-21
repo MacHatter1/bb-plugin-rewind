@@ -1,6 +1,6 @@
 // Per-key async mutex. The host worker is the only writer of a shadow
-// repository, so serializing by shadow key serializes every git operation on
-// that workspace: snapshots from the dispatch gate, restores, diffs, and GC.
+// repository. Workspace keys serialize snapshots, restores and diffs;
+// maintenance keys serialize repacking, GC and shadow removal separately.
 
 import { realpath, stat } from "node:fs/promises";
 
@@ -44,4 +44,42 @@ export async function withLock<T>(key: string, fn: () => Promise<T>, signal?: Ab
 /** Number of keys with queued or running work (tests and status). */
 export function activeLockCount(): number {
   return tails.size;
+}
+
+type Waiter = { write: boolean; enter: () => void };
+const gates = new Map<string, { readers: number; writer: boolean; queue: Waiter[] }>();
+
+/** Fair host-wide gate: GC drains readers before changing shared object lifetime. */
+export async function withReadWriteLock<T>(key: string, write: boolean, fn: () => Promise<T>, signal?: AbortSignal): Promise<T> {
+  signal?.throwIfAborted();
+  let gate = gates.get(key);
+  if (gate === undefined) { gate = { readers: 0, writer: false, queue: [] }; gates.set(key, gate); }
+  const state = gate;
+  const drain = () => {
+    if (state.writer) return;
+    while (state.queue.length > 0) {
+      const next = state.queue[0]!;
+      if (next.write && state.readers > 0) return;
+      state.queue.shift();
+      if (next.write) state.writer = true; else state.readers++;
+      next.enter();
+      if (next.write) return;
+    }
+    if (state.readers === 0) gates.delete(key);
+  };
+  let waiter!: Waiter;
+  let cancel: (() => void) | undefined;
+  await new Promise<void>((resolve, reject) => {
+    waiter = { write, enter: resolve };
+    cancel = () => {
+      const index = state.queue.indexOf(waiter);
+      if (index < 0) return;
+      state.queue.splice(index, 1); drain();
+      reject(signal?.reason ?? new Error("Work cancelled"));
+    };
+    signal?.addEventListener("abort", cancel, { once: true });
+    state.queue.push(waiter); drain();
+  }).finally(() => { if (cancel !== undefined) signal?.removeEventListener("abort", cancel); });
+  try { signal?.throwIfAborted(); return await fn(); }
+  finally { if (write) state.writer = false; else state.readers--; drain(); }
 }
